@@ -13,6 +13,7 @@ CAPTURE_BUNDLE_ID="com.guiming.wrong-question-daily-organizer"
 PRACTICE_PRODUCT="MedicalQuestionPractice"
 PRACTICE_DISPLAY_NAME="错题刷题工具"
 PRACTICE_BUNDLE_ID="com.guiming.medical-question-practice"
+LEGACY_PRACTICE_DISPLAY_NAME="医学综合练习"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
@@ -119,8 +120,32 @@ open_practice() {
 }
 
 install_bundles() {
+  remove_installed_app_if_owned "/Applications/$CAPTURE_DISPLAY_NAME.app" "$CAPTURE_BUNDLE_ID"
+  remove_installed_app_if_owned "/Applications/$PRACTICE_DISPLAY_NAME.app" "$PRACTICE_BUNDLE_ID"
+  remove_installed_app_if_owned "/Applications/$LEGACY_PRACTICE_DISPLAY_NAME.app" "$PRACTICE_BUNDLE_ID"
   /usr/bin/ditto "$CAPTURE_BUNDLE" "/Applications/$CAPTURE_DISPLAY_NAME.app"
   /usr/bin/ditto "$PRACTICE_BUNDLE" "/Applications/$PRACTICE_DISPLAY_NAME.app"
+}
+
+remove_installed_app_if_owned() {
+  local app_path="$1"
+  local expected_bundle_id="$2"
+  local plist_path="$app_path/Contents/Info.plist"
+
+  [[ -d "$app_path" ]] || return 0
+  if [[ ! -f "$plist_path" ]]; then
+    echo "拒绝替换无法验证身份的应用：$app_path" >&2
+    exit 1
+  fi
+
+  local actual_bundle_id
+  actual_bundle_id="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$plist_path" 2>/dev/null || true)"
+  if [[ "$actual_bundle_id" != "$expected_bundle_id" ]]; then
+    echo "拒绝替换 Bundle ID 不匹配的应用：$app_path" >&2
+    exit 1
+  fi
+
+  /bin/rm -rf "$app_path"
 }
 
 verify_processes() {
