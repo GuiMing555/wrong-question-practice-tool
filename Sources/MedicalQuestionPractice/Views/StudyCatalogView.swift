@@ -21,7 +21,7 @@ struct StudyCatalogRootView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 6) {
-                    Text("考试题本练习")
+                    Text("错题刷题工具")
                         .font(.largeTitle.weight(.semibold))
                     Text("选择考试类型后，再进入对应科目和练习方式。")
                         .foregroundStyle(.secondary)
@@ -58,7 +58,7 @@ struct StudyCatalogRootView: View {
             .frame(maxWidth: 1080, alignment: .leading)
             .frame(maxWidth: .infinity)
         }
-        .navigationTitle("考试题本练习")
+        .navigationTitle("错题刷题工具")
         .catalogSettingsToolbar()
     }
 }

@@ -23,7 +23,7 @@ public partial class App : Application
         {
             MessageBox.Show(
                 $"无法打开本地题库。\n\n{exception.Message}",
-                "医学综合练习",
+                "错题刷题工具",
                 MessageBoxButton.OK,
                 MessageBoxImage.Error);
             Shutdown(1);

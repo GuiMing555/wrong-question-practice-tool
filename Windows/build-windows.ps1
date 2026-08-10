@@ -3,7 +3,7 @@ Set-StrictMode -Version Latest
 
 $WindowsRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $ReleaseRoot = Join-Path $WindowsRoot "release\win-x64"
-$PracticeOutput = Join-Path $ReleaseRoot "医学综合练习"
+$PracticeOutput = Join-Path $ReleaseRoot "错题刷题工具"
 $CaptureOutput = Join-Path $ReleaseRoot "错题截图整理"
 
 Push-Location $WindowsRoot
@@ -30,7 +30,7 @@ try {
         -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true `
         -o $CaptureOutput
 
-    $PracticeZip = Join-Path $ReleaseRoot "医学综合练习-win-x64.zip"
+    $PracticeZip = Join-Path $ReleaseRoot "错题刷题工具-win-x64.zip"
     $CaptureZip = Join-Path $ReleaseRoot "错题截图整理-win-x64.zip"
     Compress-Archive -Path (Join-Path $PracticeOutput "*") -DestinationPath $PracticeZip -Force
     Compress-Archive -Path (Join-Path $CaptureOutput "*") -DestinationPath $CaptureZip -Force

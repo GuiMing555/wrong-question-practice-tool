@@ -3,7 +3,7 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:views="clr-namespace:MedicalQuestionPractice.Windows.Views"
         xmlns:vm="clr-namespace:MedicalQuestionPractice.Windows.ViewModels"
-        Title="医学综合练习" Width="1100" Height="760" MinWidth="860" MinHeight="620"
+        Title="错题刷题工具" Width="1100" Height="760" MinWidth="860" MinHeight="620"
         WindowStartupLocation="CenterScreen" Activated="Window_Activated">
     <Window.InputBindings>
         <KeyBinding Key="Escape" Command="{Binding GoHomeCommand}" />
@@ -25,7 +25,7 @@
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
                 <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
-                    <TextBlock Text="医学综合练习" FontSize="22" FontWeight="Bold" />
+                    <TextBlock Text="错题刷题工具" FontSize="22" FontWeight="Bold" />
                     <TextBlock Text="本地题库" Foreground="{StaticResource MutedTextBrush}" FontSize="13" VerticalAlignment="Bottom" Margin="12,0,0,2" />
                 </StackPanel>
                 <StackPanel Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
