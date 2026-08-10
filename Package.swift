@@ -38,7 +38,6 @@ let package = Package(
                 .linkedFramework("Carbon"),
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("Vision"),
-                .linkedFramework("NaturalLanguage"),
                 .linkedFramework("ImageIO")
             ]
         ),

@@ -1,4 +1,6 @@
+import AppKit
 import Foundation
+import QuestionBankCore
 
 @MainActor
 final class PracticeAppStore: ObservableObject {
@@ -9,15 +11,43 @@ final class PracticeAppStore: ObservableObject {
     @Published private(set) var reviewedAnswer: AnsweredQuestionReview?
     @Published private(set) var isLoading = false
     @Published private(set) var isSubmitting = false
+    @Published private(set) var isBuildingKnowledgeDocument = false
+    @Published private(set) var currentScope: PracticeScope
     @Published var presentedError: PresentedError?
 
-    private let repository: any PracticeRepository
+    private var repository: any PracticeRepository
     private var pendingSubmissionTokens: [String: String] = [:]
     private var answerHistory: [AnsweredQuestionReview] = []
     private var reviewedAnswerIndex: Int?
 
-    init(repository: any PracticeRepository) {
-        self.repository = repository
+    init(initialSubject: StudySubject = .medicalComprehensive) {
+        currentScope = .education(initialSubject)
+        repository = PracticeRepositoryFactory.make(scope: .education(initialSubject))
+    }
+
+    func selectSubject(_ subject: StudySubject) async {
+        await selectScope(.education(subject))
+    }
+
+    func selectXingceCategory(_ category: XingceCategory) async {
+        await selectScope(.xingce(category))
+    }
+
+    private func selectScope(_ scope: PracticeScope) async {
+        guard session == nil else { return }
+        if currentScope != scope {
+            currentScope = scope
+            repository = await Task.detached(priority: .userInitiated) {
+                PracticeRepositoryFactory.make(scope: scope)
+            }.value
+            dashboard = .empty
+            feedback = nil
+            answeredQuestion = nil
+            reviewedAnswer = nil
+            answerHistory.removeAll()
+            pendingSubmissionTokens.removeAll()
+        }
+        await refreshDashboard()
     }
 
     func refreshDashboard() async {
@@ -47,7 +77,7 @@ final class PracticeAppStore: ObservableObject {
         }
     }
 
-    func submit(selectedOptionIDs: Set<String>, markAsUnsure: Bool) async {
+    func submit(selectedOptionIDs: Set<String>, typedAnswer: String? = nil, markAsUnsure: Bool) async {
         guard let session, let question = session.currentQuestion,
               feedback == nil, !isSubmitting else { return }
 
@@ -62,6 +92,7 @@ final class PracticeAppStore: ObservableObject {
                 sessionID: session.id,
                 itemID: question.id,
                 selectedOptionIDs: selectedOptionIDs,
+                typedAnswer: typedAnswer,
                 submissionToken: token,
                 markAsUnsure: markAsUnsure
             )
@@ -178,6 +209,18 @@ final class PracticeAppStore: ObservableObject {
     func saveSettings(_ settings: PracticeSettings) async throws {
         try await repository.saveSettings(settings)
         await refreshDashboard()
+    }
+
+    func buildCurrentWrongKnowledgeDocument() async {
+        guard !isBuildingKnowledgeDocument else { return }
+        isBuildingKnowledgeDocument = true
+        defer { isBuildingKnowledgeDocument = false }
+        do {
+            let output = try await repository.buildCurrentWrongKnowledgeDocument()
+            NSWorkspace.shared.activateFileViewerSelecting([output])
+        } catch {
+            present(error)
+        }
     }
 
     private func present(_ error: Error) {

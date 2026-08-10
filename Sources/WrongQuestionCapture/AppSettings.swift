@@ -1,4 +1,5 @@
 import Foundation
+import QuestionBankCore
 
 enum CaptureShortcut: String, CaseIterable {
     case rightShift
@@ -52,14 +53,24 @@ struct AppSettings {
         static let outputFolderPath = "outputFolderPath"
         static let captureShortcut = "captureShortcut"
         static let recognitionMode = "recognitionMode"
+        static let contentServiceEnabled = "contentServiceEnabled"
+        static let contentServiceEndpoint = "contentServiceEndpoint"
+        static let contentServiceModel = "contentServiceModel"
+        static let generateWordDocuments = "generateWordDocuments"
         static let dailyOrganizeEnabled = "dailyOrganizeEnabled"
         static let initialized = "settingsInitializedV3"
+        static let questionBookTerminologyMigrated = "questionBookTerminologyMigratedV1"
     }
 
     var captureFolderPath: String
     var outputFolderPath: String
     var captureShortcut: CaptureShortcut
     var recognitionMode: RecognitionMode
+    var contentServiceEnabled: Bool
+    var contentServiceEndpoint: String
+    var contentServiceModel: String
+    var contentServiceAccessKey: String
+    var generateWordDocuments: Bool
     var dailyOrganizeEnabled: Bool
 
     static var defaults: AppSettings {
@@ -69,22 +80,66 @@ struct AppSettings {
         return AppSettings(
             captureFolderPath: capture,
             outputFolderPath: URL(fileURLWithPath: capture)
-                .appendingPathComponent("错题本", isDirectory: true).path,
+                .appendingPathComponent("题本", isDirectory: true).path,
             captureShortcut: .rightShift,
             recognitionMode: .fentiQuestionBank,
+            contentServiceEnabled: false,
+            contentServiceEndpoint: "",
+            contentServiceModel: "",
+            contentServiceAccessKey: "",
+            generateWordDocuments: false,
             dailyOrganizeEnabled: true
         )
     }
 
     static func load() -> AppSettings {
         let defaults = UserDefaults.standard
-        guard defaults.bool(forKey: Key.initialized) else { return .defaults }
         let fallback = AppSettings.defaults
+        let shared = SharedContentServiceConfigurationStore.load()
+        guard defaults.bool(forKey: Key.initialized) else {
+            var value = fallback
+            value.contentServiceEnabled = shared.enabled
+            value.contentServiceEndpoint = shared.endpoint
+            value.contentServiceModel = shared.model
+            value.contentServiceAccessKey = shared.accessKey
+            value.outputFolderPath = shared.knowledgeDocumentFolderPath
+            return value.normalized()
+        }
+        let storedCapture = defaults.string(forKey: Key.captureFolderPath) ?? ""
+        let storedOutput = defaults.string(forKey: Key.outputFolderPath) ?? ""
+        let captureFolderPath = storedCapture.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? fallback.captureFolderPath : storedCapture
+        var outputFolderPath = storedOutput.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            ? fallback.outputFolderPath : storedOutput
+        if !defaults.bool(forKey: Key.questionBookTerminologyMigrated) {
+            let legacyDefaultPath = URL(fileURLWithPath: captureFolderPath, isDirectory: true)
+                .appendingPathComponent("错题本", isDirectory: true)
+                .standardizedFileURL.path
+            let wasLegacyDefault = URL(fileURLWithPath: outputFolderPath, isDirectory: true)
+                .standardizedFileURL.path == legacyDefaultPath
+            outputFolderPath = migrateLegacyQuestionBookLocation(
+                captureFolderPath: captureFolderPath,
+                outputFolderPath: outputFolderPath
+            )
+            defaults.set(outputFolderPath, forKey: Key.outputFolderPath)
+            defaults.set(
+                !wasLegacyDefault || outputFolderPath != legacyDefaultPath,
+                forKey: Key.questionBookTerminologyMigrated
+            )
+        }
+        if !shared.knowledgeDocumentFolderPath.isEmpty {
+            outputFolderPath = shared.knowledgeDocumentFolderPath
+        }
         return AppSettings(
-            captureFolderPath: defaults.string(forKey: Key.captureFolderPath) ?? fallback.captureFolderPath,
-            outputFolderPath: defaults.string(forKey: Key.outputFolderPath) ?? fallback.outputFolderPath,
+            captureFolderPath: captureFolderPath,
+            outputFolderPath: outputFolderPath,
             captureShortcut: CaptureShortcut(rawValue: defaults.string(forKey: Key.captureShortcut) ?? "") ?? .rightShift,
             recognitionMode: RecognitionMode(rawValue: defaults.string(forKey: Key.recognitionMode) ?? "") ?? .fentiQuestionBank,
+            contentServiceEnabled: shared.enabled,
+            contentServiceEndpoint: shared.endpoint,
+            contentServiceModel: shared.model,
+            contentServiceAccessKey: shared.accessKey,
+            generateWordDocuments: defaults.bool(forKey: Key.generateWordDocuments),
             dailyOrganizeEnabled: defaults.object(forKey: Key.dailyOrganizeEnabled) as? Bool ?? true
         ).normalized()
     }
@@ -97,6 +152,19 @@ struct AppSettings {
         defaults.set(value.outputFolderPath, forKey: Key.outputFolderPath)
         defaults.set(value.captureShortcut.rawValue, forKey: Key.captureShortcut)
         defaults.set(value.recognitionMode.rawValue, forKey: Key.recognitionMode)
+        defaults.set(value.contentServiceEnabled, forKey: Key.contentServiceEnabled)
+        defaults.set(value.contentServiceEndpoint, forKey: Key.contentServiceEndpoint)
+        defaults.set(value.contentServiceModel, forKey: Key.contentServiceModel)
+        try SharedContentServiceConfigurationStore.save(
+            SharedContentServiceConfiguration(
+                enabled: value.contentServiceEnabled,
+                endpoint: value.contentServiceEndpoint,
+                model: value.contentServiceModel,
+                accessKey: value.contentServiceAccessKey,
+                knowledgeDocumentFolderPath: value.outputFolderPath
+            )
+        )
+        defaults.set(value.generateWordDocuments, forKey: Key.generateWordDocuments)
         defaults.set(value.dailyOrganizeEnabled, forKey: Key.dailyOrganizeEnabled)
         defaults.set(true, forKey: Key.initialized)
     }
@@ -105,6 +173,9 @@ struct AppSettings {
         var value = self
         value.captureFolderPath = Self.normalizePath(captureFolderPath)
         value.outputFolderPath = Self.normalizePath(outputFolderPath)
+        value.contentServiceEndpoint = contentServiceEndpoint.trimmingCharacters(in: .whitespacesAndNewlines)
+        value.contentServiceModel = contentServiceModel.trimmingCharacters(in: .whitespacesAndNewlines)
+        value.contentServiceAccessKey = contentServiceAccessKey.trimmingCharacters(in: .whitespacesAndNewlines)
         return value
     }
 
@@ -116,6 +187,25 @@ struct AppSettings {
         }
         try FileManager.default.createDirectory(at: captureFolderURL, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: outputFolderURL, withIntermediateDirectories: true)
+        if contentServiceEnabled {
+            guard let url = URL(string: contentServiceEndpoint),
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "https" || (scheme == "http" && Self.isLocalEndpoint(url))
+            else {
+                throw NSError(
+                    domain: "AppSettings",
+                    code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "启用题目分析 API 时必须填写 HTTPS 接口地址；本机接口可使用 HTTP。"]
+                )
+            }
+            guard !contentServiceAccessKey.isEmpty else {
+                throw NSError(
+                    domain: "AppSettings",
+                    code: 3,
+                    userInfo: [NSLocalizedDescriptionKey: "启用题目分析 API 时必须填写访问密钥。"]
+                )
+            }
+        }
     }
 
     var captureFolderURL: URL { URL(fileURLWithPath: captureFolderPath, isDirectory: true).standardizedFileURL }
@@ -126,5 +216,51 @@ struct AppSettings {
         guard !trimmed.isEmpty else { return "" }
         let expanded = (trimmed as NSString).expandingTildeInPath
         return URL(fileURLWithPath: expanded, isDirectory: true).standardizedFileURL.path
+    }
+
+    private static func isLocalEndpoint(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        return host == "localhost" || host == "127.0.0.1" || host == "::1"
+    }
+
+    private static func migrateLegacyQuestionBookLocation(
+        captureFolderPath: String,
+        outputFolderPath: String,
+        fileManager: FileManager = .default
+    ) -> String {
+        let capture = URL(fileURLWithPath: captureFolderPath, isDirectory: true).standardizedFileURL
+        let current = URL(fileURLWithPath: outputFolderPath, isDirectory: true).standardizedFileURL
+        let legacy = capture.appendingPathComponent("错题本", isDirectory: true).standardizedFileURL
+        guard current.path == legacy.path else { return current.path }
+
+        let questionBook = capture.appendingPathComponent("题本", isDirectory: true).standardizedFileURL
+        do {
+            if fileManager.fileExists(atPath: legacy.path) {
+                guard !fileManager.fileExists(atPath: questionBook.path) else { return current.path }
+                try fileManager.moveItem(at: legacy, to: questionBook)
+            } else {
+                try fileManager.createDirectory(at: questionBook, withIntermediateDirectories: true)
+            }
+        } catch {
+            return current.path
+        }
+        try? renameLegacyGeneratedFiles(in: questionBook, fileManager: fileManager)
+        return questionBook.path
+    }
+
+    private static func renameLegacyGeneratedFiles(in folder: URL, fileManager: FileManager) throws {
+        let replacements = [
+            "医学综合错题题库.xlsx": "医学综合题本.xlsx",
+            "医学综合错题本_纯题.docx": "医学综合题本_纯题.docx",
+            "医学综合错题本_答案与解析.docx": "医学综合题本_答案与解析.docx"
+        ]
+        for (legacyName, questionBookName) in replacements {
+            let source = folder.appendingPathComponent(legacyName, isDirectory: false)
+            let destination = folder.appendingPathComponent(questionBookName, isDirectory: false)
+            guard fileManager.fileExists(atPath: source.path),
+                  !fileManager.fileExists(atPath: destination.path)
+            else { continue }
+            try fileManager.moveItem(at: source, to: destination)
+        }
     }
 }

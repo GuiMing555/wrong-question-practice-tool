@@ -2,6 +2,26 @@
 .DS_Store
 dist/
 outputs/
+extracted/
+
+# Local service credentials and signing material
+.env
+.env.*
+*.p12
+*.pfx
+*.pem
+*.key
+*.cer
+*.crt
+*.mobileprovision
+*.provisionprofile
+content-service-settings.json
+content-service-credential.json
+
+# Local data-audit utilities; product builds use build_civil_service_bank.py only
+script/build_civil_service_workbooks.mjs
+script/filter_civil_service_image_questions.mjs
+script/import_verified_subjective_answers_*.py
 
 # Local question data and generated documents
 *.sqlite3

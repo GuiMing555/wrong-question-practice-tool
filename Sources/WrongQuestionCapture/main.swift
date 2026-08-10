@@ -2,16 +2,22 @@ import AppKit
 import ApplicationServices
 import Carbon
 import CoreGraphics
+import QuestionBankCore
 
 private let hotKeySignature: OSType = 0x57514350 // "WQCP"
 private let setTargetHotKeyID: UInt32 = 1
 private let captureHotKeyID: UInt32 = 2
+private let captureBundleIdentifier = "com.guiming.wrong-question-daily-organizer"
+private let captureActivationNotification = Notification.Name(
+    "com.guiming.wrong-question-daily-organizer.activate-existing-instance"
+)
 
 private struct TargetWindow {
     let id: CGWindowID
     let ownerPID: pid_t
     let ownerName: String
     let title: String
+    let bounds: CGRect
 
     var displayName: String {
         let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -59,13 +65,49 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var organizerStatusItem: NSMenuItem!
     private var settings = AppSettings.load()
     private var settingsWindowController: SettingsWindowController?
+    private var apiSettingsWindowController: APISettingsWindowController?
+    private var progressWindowController: OrganizeProgressWindowController?
+    private var didShowScreenCaptureGuidance = false
+    private var singleInstanceLock: SingleInstanceLock?
+    private var activationObserver: NSObjectProtocol?
+    private var shouldRun = true
+
+    func applicationWillFinishLaunching(_ notification: Notification) {
+        do {
+            guard let lock = try SingleInstanceLock.acquire(identifier: captureBundleIdentifier) else {
+                shouldRun = false
+                requestExistingInstanceActivation()
+                DispatchQueue.main.async { NSApp.terminate(nil) }
+                return
+            }
+            singleInstanceLock = lock
+            activationObserver = DistributedNotificationCenter.default().addObserver(
+                forName: captureActivationNotification,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                self?.showSettings()
+            }
+        } catch {
+            let hasExistingInstance = NSRunningApplication
+                .runningApplications(withBundleIdentifier: captureBundleIdentifier)
+                .contains { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }
+            if hasExistingInstance {
+                shouldRun = false
+                requestExistingInstanceActivation()
+                DispatchQueue.main.async { NSApp.terminate(nil) }
+            }
+        }
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        guard shouldRun else { return }
         NSApp.setActivationPolicy(.accessory)
         configureMenuBar()
         registerGlobalHotKeys()
         installRightShiftMonitor()
-        requestAccessibilityPermission()
+        refreshAccessibilityPermission(requestOnceIfNeeded: true)
+        try? synchronizeWorkbookOutputPaths(exportImmediately: true)
         _ = try? synchronizeLocalSchedule(showErrors: false)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             self?.showSettings()
@@ -77,6 +119,21 @@ final class AppController: NSObject, NSApplicationDelegate {
         if let captureHotKey { UnregisterEventHotKey(captureHotKey) }
         if let eventHandler { RemoveEventHandler(eventHandler) }
         if let globalEventMonitor { NSEvent.removeMonitor(globalEventMonitor) }
+        if let activationObserver {
+            DistributedNotificationCenter.default().removeObserver(activationObserver)
+        }
+    }
+
+    private func requestExistingInstanceActivation() {
+        DistributedNotificationCenter.default().postNotificationName(
+            captureActivationNotification,
+            object: nil,
+            userInfo: nil,
+            deliverImmediately: true
+        )
+        NSRunningApplication.runningApplications(withBundleIdentifier: captureBundleIdentifier)
+            .first { $0.processIdentifier != ProcessInfo.processInfo.processIdentifier }?
+            .activate(options: [.activateAllWindows])
     }
 
     private func configureMenuBar() {
@@ -97,12 +154,25 @@ final class AppController: NSObject, NSApplicationDelegate {
         )
         settingsItem.target = self
         menu.addItem(settingsItem)
+        let apiSettingsItem = NSMenuItem(
+            title: "API 设置…",
+            action: #selector(showAPISettings),
+            keyEquivalent: ""
+        )
+        apiSettingsItem.target = self
+        menu.addItem(apiSettingsItem)
+        let permissionsItem = NSMenuItem(
+            title: "检查系统权限…",
+            action: #selector(showSystemPermissions),
+            keyEquivalent: ""
+        )
+        permissionsItem.target = self
+        menu.addItem(permissionsItem)
         menu.addItem(.separator())
 
         targetDescriptionItem = NSMenuItem(title: "目标：未设置", action: nil, keyEquivalent: "")
         targetDescriptionItem.isEnabled = false
         menu.addItem(targetDescriptionItem)
-        menu.addItem(.separator())
 
         let setTargetItem = NSMenuItem(
             title: "设定当前前台窗口为目标    ⌃⌥⇧1",
@@ -113,7 +183,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         menu.addItem(setTargetItem)
 
         captureItem = NSMenuItem(
-            title: "截图目标窗口                 \(settings.captureShortcut.menuTitle)",
+            title: "保存目标页面内容             \(settings.captureShortcut.menuTitle)",
             action: #selector(captureTargetWindow),
             keyEquivalent: ""
         )
@@ -121,7 +191,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         menu.addItem(captureItem)
         menu.addItem(.separator())
 
-        lastCaptureItem = NSMenuItem(title: "最近截图：暂无", action: nil, keyEquivalent: "")
+        lastCaptureItem = NSMenuItem(title: "最近采集：暂无", action: nil, keyEquivalent: "")
         lastCaptureItem.isEnabled = false
         menu.addItem(lastCaptureItem)
 
@@ -133,7 +203,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         openFolderItem.target = self
         menu.addItem(openFolderItem)
         let organizeItem = NSMenuItem(
-            title: "立即整理错题本",
+            title: "立即整理题本",
             action: #selector(organizeNow),
             keyEquivalent: ""
         )
@@ -141,7 +211,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         menu.addItem(organizeItem)
 
         let openBooksItem = NSMenuItem(
-            title: "打开错题本文件夹",
+            title: "打开题本文件夹",
             action: #selector(openBooksFolder),
             keyEquivalent: ""
         )
@@ -278,11 +348,14 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func requestAccessibilityPermission() {
-        let promptKey = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
-        let options = [promptKey: true] as CFDictionary
-        if settings.captureShortcut == .rightShift && !AXIsProcessTrustedWithOptions(options) {
+    private func refreshAccessibilityPermission(requestOnceIfNeeded: Bool) {
+        guard settings.captureShortcut == .rightShift else { return }
+        if requestOnceIfNeeded {
+            _ = CapturePermissionManager.requestAccessibilityOnceIfNeeded()
+        }
+        if !CapturePermissionManager.accessibilityGranted {
             lastCaptureItem.title = "轻点右⇧需要辅助功能权限，授权后请重启"
+            statusItem.button?.title = "!"
         }
     }
 
@@ -309,7 +382,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
 
         targetWindow = window
-        targetDescriptionItem.title = "目标：\(shortened(window.displayName, limit: 42))"
+        targetDescriptionItem.title = "快照目标：\(shortened(window.displayName, limit: 40))"
         statusItem.button?.title = "✓"
         NSSound(named: "Tink")?.play()
     }
@@ -323,23 +396,48 @@ final class AppController: NSObject, NSApplicationDelegate {
             return
         }
 
-        if #available(macOS 10.15, *), !CGPreflightScreenCaptureAccess() {
-            let granted = CGRequestScreenCaptureAccess()
-            if !granted {
-                showAlert(
-                    title: "需要屏幕录制权限",
-                    message: "请在“系统设置 → 隐私与安全性 → 屏幕与系统音频录制”中允许本程序，然后重新启动。"
-                )
-                return
-            }
-        }
-
         guard windowStillExists(targetWindow.id) else {
             self.targetWindow = nil
             targetDescriptionItem.title = "目标：窗口已关闭，请重新设置"
             statusItem.button?.title = "!"
             showAlert(title: "目标窗口已关闭", message: "请重新设定当前前台窗口。")
             return
+        }
+
+        let pageText = BrowserWindowSnapshotReader().readPageText(
+            ownerPID: targetWindow.ownerPID,
+            windowTitle: targetWindow.title,
+            bounds: targetWindow.bounds
+        )
+        if let pageText,
+           WrongQuestionOrganizer().pageSnapshotIsUsable(pageText) {
+            do {
+                let outputURL = try save(pageText: pageText, target: targetWindow)
+                lastCaptureItem.title = "最近页面数据：\(outputURL.lastPathComponent)"
+                statusItem.button?.title = "✓"
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(outputURL.path, forType: .string)
+                NSSound(named: "Pop")?.play()
+            } catch {
+                showAlert(title: "保存失败", message: error.localizedDescription)
+            }
+            return
+        }
+
+        if !CapturePermissionManager.screenCaptureGranted {
+            let didRequestPermission = CapturePermissionManager.requestScreenCaptureOnceIfNeeded()
+            if !CapturePermissionManager.screenCaptureGranted {
+                lastCaptureItem.title = "页面数据不完整，屏幕录制权限未开启"
+                statusItem.button?.title = "!"
+                if !didRequestPermission && !didShowScreenCaptureGuidance {
+                    didShowScreenCaptureGuidance = true
+                    showAlert(
+                        title: "需要屏幕录制权限",
+                        message: "本次直接读取的页面数据不完整，需要回退保存窗口图像。请从菜单或设置页点击“检查系统权限…”，授权后重新启动。"
+                    )
+                }
+                return
+            }
         }
 
         guard let image = CGWindowListCreateImage(
@@ -357,8 +455,8 @@ final class AppController: NSObject, NSApplicationDelegate {
 
         do {
             let outputURL = try save(image: image, target: targetWindow)
-            lastCaptureItem.title = "最近截图：\(outputURL.lastPathComponent)"
-            statusItem.button?.title = "✓"
+            lastCaptureItem.title = "页面数据不完整，已回退保存窗口图像"
+            statusItem.button?.title = "!"
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(outputURL.path, forType: .string)
             NSSound(named: "Pop")?.play()
@@ -396,7 +494,8 @@ final class AppController: NSObject, NSApplicationDelegate {
                 id: CGWindowID(windowNumber),
                 ownerPID: ownerPID,
                 ownerName: ownerName,
-                title: title
+                title: title,
+                bounds: bounds
             )
             return (target, bounds.width * bounds.height)
         }
@@ -432,6 +531,19 @@ final class AppController: NSObject, NSApplicationDelegate {
             )
         }
         try data.write(to: outputURL, options: .atomic)
+        return outputURL
+    }
+
+    private func save(pageText: String, target: TargetWindow) throws -> URL {
+        let folder = try datedCaptureFolder()
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "yyyyMMdd_HHmmss_SSS"
+
+        let windowLabel = sanitizeFileName(target.title.isEmpty ? target.ownerName : target.title)
+        let fileName = "错题_\(formatter.string(from: Date()))_\(windowLabel)\(PageSnapshotSidecar.standaloneSuffix)"
+        let outputURL = folder.appendingPathComponent(fileName)
+        try PageSnapshotSidecar.writeStandalone(pageText, to: outputURL)
         return outputURL
     }
 
@@ -477,7 +589,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         do {
             NSWorkspace.shared.open(try WrongQuestionOrganizer.outputFolder(settings: settings))
         } catch {
-            showAlert(title: "无法打开错题本文件夹", message: error.localizedDescription)
+            showAlert(title: "无法打开题本文件夹", message: error.localizedDescription)
         }
     }
 
@@ -486,18 +598,31 @@ final class AppController: NSObject, NSApplicationDelegate {
         organizerIsRunning = true
         organizerStatusItem.title = "正在识别并整理……"
         statusItem.button?.title = "…"
+        let progressController = progressWindowController ?? OrganizeProgressWindowController()
+        progressWindowController = progressController
+        progressController.begin()
+        NSApp.activate(ignoringOtherApps: true)
+        progressController.showWindow(nil)
+        progressController.window?.makeKeyAndOrderFront(nil)
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
-                let report = try WrongQuestionOrganizer().run(settings: self?.settings ?? .load())
+                let report = try WrongQuestionOrganizer().run(
+                    settings: self?.settings ?? .load(),
+                    progress: { update in
+                        DispatchQueue.main.async { [weak self] in
+                            self?.progressWindowController?.update(update)
+                        }
+                    }
+                )
                 DispatchQueue.main.async {
                     guard let self else { return }
                     self.organizerIsRunning = false
                     self.organizerStatusItem.title = self.scheduleStatusTitle
                     self.statusItem.button?.title = "✓"
                     self.settingsWindowController?.showStatus(report.summary)
+                    self.progressWindowController?.complete(report)
                     NSSound(named: "Glass")?.play()
-                    self.showAlert(title: "错题本已更新", message: report.summary)
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -506,7 +631,7 @@ final class AppController: NSObject, NSApplicationDelegate {
                     self.organizerStatusItem.title = "整理失败：请查看提示"
                     self.statusItem.button?.title = "!"
                     self.settingsWindowController?.showStatus(error.localizedDescription, isError: true)
-                    self.showAlert(title: "整理失败", message: error.localizedDescription)
+                    self.progressWindowController?.fail(error)
                 }
             }
         }
@@ -532,27 +657,13 @@ final class AppController: NSObject, NSApplicationDelegate {
         if settingsWindowController == nil {
             let controller = SettingsWindowController(settings: settings)
             controller.onSave = { [weak self] proposed in
-                guard let self else {
-                    return .failure(NSError(domain: "Settings", code: 1,
-                                            userInfo: [NSLocalizedDescriptionKey: "应用已退出。"]))
-                }
-                do {
-                    let normalized = proposed.normalized()
-                    try normalized.save()
-                    self.settings = normalized
-                    self.captureItem.title = "截图目标窗口                 \(normalized.captureShortcut.menuTitle)"
-                    self.organizerStatusItem.title = self.scheduleStatusTitle
-                    self.rightShiftIsDown = false
-                    self.rightShiftWasUsedAsModifier = false
-                    self.registerCaptureHotKey()
-                    self.requestAccessibilityPermission()
-                    try self.synchronizeLocalSchedule(showErrors: true)
-                    return .success("设置已保存；截图和三份 Word 文档都将写入新位置。")
-                } catch {
-                    return .failure(error)
-                }
+                self?.saveSettings(proposed) ?? .failure(
+                    NSError(domain: "Settings", code: 1, userInfo: [NSLocalizedDescriptionKey: "应用已退出。"])
+                )
             }
             controller.onOrganize = { [weak self] in self?.organizeNow() }
+            controller.onOpenAPISettings = { [weak self] in self?.showAPISettings() }
+            controller.onOpenSystemPermissions = { [weak self] in self?.showSystemPermissions() }
             settingsWindowController = controller
         } else {
             settingsWindowController?.apply(settings)
@@ -560,6 +671,99 @@ final class AppController: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         settingsWindowController?.showWindow(nil)
         settingsWindowController?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    @objc private func showAPISettings() {
+        if apiSettingsWindowController == nil {
+            let controller = APISettingsWindowController(settings: settings)
+            controller.onSave = { [weak self] proposed in
+                self?.saveSettings(proposed) ?? .failure(
+                    NSError(domain: "Settings", code: 1, userInfo: [NSLocalizedDescriptionKey: "应用已退出。"])
+                )
+            }
+            apiSettingsWindowController = controller
+        } else {
+            apiSettingsWindowController?.apply(settings)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        apiSettingsWindowController?.showWindow(nil)
+        apiSettingsWindowController?.window?.makeKeyAndOrderFront(nil)
+    }
+
+    private func saveSettings(_ proposed: AppSettings) -> Result<String, Error> {
+        do {
+            let normalized = proposed.normalized()
+            let previousShortcut = settings.captureShortcut
+            try normalized.save()
+            settings = normalized
+            captureItem.title = "保存目标页面内容             \(normalized.captureShortcut.menuTitle)"
+            organizerStatusItem.title = scheduleStatusTitle
+            rightShiftIsDown = false
+            rightShiftWasUsedAsModifier = false
+            registerCaptureHotKey()
+            refreshAccessibilityPermission(
+                requestOnceIfNeeded: previousShortcut != .rightShift && normalized.captureShortcut == .rightShift
+            )
+            try synchronizeLocalSchedule(showErrors: true)
+            try synchronizeWorkbookOutputPaths(exportImmediately: true)
+            settingsWindowController?.apply(normalized)
+            apiSettingsWindowController?.apply(normalized)
+            return .success("设置已保存到本机。")
+        } catch {
+            return .failure(error)
+        }
+    }
+
+    @objc private func showSystemPermissions() {
+        NSApp.activate(ignoringOtherApps: true)
+        let needsAccessibility = settings.captureShortcut == .rightShift
+        let accessibilityGranted = CapturePermissionManager.accessibilityGranted
+        let screenCaptureGranted = CapturePermissionManager.screenCaptureGranted
+
+        let alert = NSAlert()
+        alert.messageText = "系统权限"
+        alert.informativeText = [
+            "辅助功能（右 Shift 快捷键）：\(needsAccessibility ? (accessibilityGranted ? "已开启" : "未开启") : "当前快捷键不需要")",
+            "屏幕与系统音频录制：\(screenCaptureGranted ? "已开启" : "未开启")",
+            "程序不会再在每次保存设置时重复申请权限。"
+        ].joined(separator: "\n")
+        alert.alertStyle = .informational
+
+        var actions: [() -> Void] = []
+        if needsAccessibility && !accessibilityGranted {
+            alert.addButton(withTitle: "打开辅助功能设置")
+            actions.append {
+                CapturePermissionManager.requestAccessibility()
+                CapturePermissionManager.openAccessibilitySettings()
+            }
+        }
+        if !screenCaptureGranted {
+            alert.addButton(withTitle: "打开屏幕录制设置")
+            actions.append {
+                CapturePermissionManager.requestScreenCapture()
+                CapturePermissionManager.openScreenCaptureSettings()
+            }
+        }
+        alert.addButton(withTitle: "关闭")
+
+        let response = alert.runModal()
+        let index = response.rawValue - NSApplication.ModalResponse.alertFirstButtonReturn.rawValue
+        if index >= 0, index < actions.count {
+            actions[index]()
+        }
+        refreshAccessibilityPermission(requestOnceIfNeeded: false)
+    }
+
+    private func synchronizeWorkbookOutputPaths(exportImmediately: Bool = false) throws {
+        for subject in StudySubject.allCases {
+            let store = try QuestionBankStore(
+                databaseURL: QuestionBankPaths.defaultDatabaseURL(for: subject),
+                sourceApplication: "capture-settings:\(subject.rawValue)"
+            )
+            let workbook = settings.outputFolderURL.appendingPathComponent(subject.workbookFilename)
+            try store.configureWorkbookOutput(workbook)
+            if exportImmediately { _ = try store.exportWorkbook(to: workbook) }
+        }
     }
 
     @discardableResult
@@ -579,7 +783,107 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 }
 
-if CommandLine.arguments.contains("--organize-now") {
+private func diagnosticLargestWindow(for pid: pid_t) -> TargetWindow? {
+    guard let rawList = CGWindowListCopyWindowInfo(
+        [.optionOnScreenOnly, .excludeDesktopElements],
+        kCGNullWindowID
+    ) as? [[String: Any]] else { return nil }
+    return rawList.compactMap { info -> (TargetWindow, CGFloat)? in
+        guard let ownerPID = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+              ownerPID == pid,
+              (info[kCGWindowLayer as String] as? NSNumber)?.intValue == 0,
+              let windowNumber = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
+              let boundsDictionary = info[kCGWindowBounds as String] as? NSDictionary,
+              let bounds = CGRect(dictionaryRepresentation: boundsDictionary),
+              bounds.width >= 240,
+              bounds.height >= 160
+        else { return nil }
+        let target = TargetWindow(
+            id: CGWindowID(windowNumber),
+            ownerPID: ownerPID,
+            ownerName: (info[kCGWindowOwnerName as String] as? String) ?? "未知应用",
+            title: (info[kCGWindowName as String] as? String) ?? "",
+            bounds: bounds
+        )
+        return (target, bounds.width * bounds.height)
+    }.max(by: { $0.1 < $1.1 })?.0
+}
+
+if let argument = CommandLine.arguments.first(where: {
+    $0.hasPrefix("--inspect-window-snapshot-pid=") || $0.hasPrefix("--inspect-window-parsed-pid=")
+}) {
+    let parseSnapshot = argument.hasPrefix("--inspect-window-parsed-pid=")
+    let rawPID = argument
+        .replacingOccurrences(of: "--inspect-window-snapshot-pid=", with: "")
+        .replacingOccurrences(of: "--inspect-window-parsed-pid=", with: "")
+    guard let pid = pid_t(rawPID), let target = diagnosticLargestWindow(for: pid) else {
+        FileHandle.standardError.write(Data("没有找到指定进程的可见窗口。\n".utf8))
+        exit(EXIT_FAILURE)
+    }
+    guard let snapshot = BrowserWindowSnapshotReader().readPageText(
+        ownerPID: target.ownerPID,
+        windowTitle: target.title,
+        bounds: target.bounds
+    ) else {
+        FileHandle.standardError.write(Data("没有读取到浏览器页面文字快照。\n".utf8))
+        exit(EXIT_FAILURE)
+    }
+    print(parseSnapshot ? WrongQuestionOrganizer().diagnosticParsedSnapshot(snapshot) : snapshot)
+    exit(EXIT_SUCCESS)
+} else if CommandLine.arguments.contains("--repair-pending-explanations-once") {
+    do {
+        let report = try WrongQuestionOrganizer().run(mode: .repairPendingExplanationsOnce)
+        print(report.summary)
+        exit(report.contentFailedCount == 0 ? EXIT_SUCCESS : EXIT_FAILURE)
+    } catch {
+        FileHandle.standardError.write(Data("一次性解析补全失败：\(error.localizedDescription)\n".utf8))
+        exit(EXIT_FAILURE)
+    }
+} else if CommandLine.arguments.contains("--export-knowledge-documents") {
+    do {
+        let configuration = SharedContentServiceConfigurationStore.load().normalized()
+        let outputFolder = URL(
+            fileURLWithPath: configuration.knowledgeDocumentFolderPath,
+            isDirectory: true
+        )
+        let now = Date()
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "yyyy-MM-dd"
+
+        var allRecords: [QuestionKnowledgeRecord] = []
+        var wrongRecords: [QuestionKnowledgeRecord] = []
+        for subject in StudySubject.allCases {
+            let store = try QuestionBankStore(
+                databaseURL: QuestionBankPaths.defaultDatabaseURL(for: subject),
+                sourceApplication: "knowledge-document-export:\(subject.rawValue)"
+            )
+            allRecords += try store.knowledgeRecords(subject: subject, wrongBookOnly: false)
+            wrongRecords += try store.knowledgeRecords(subject: subject, wrongBookOnly: true)
+        }
+
+        let allOutput = outputFolder.appendingPathComponent("\(formatter.string(from: now))全部知识点.docx")
+        let wrongOutput = outputFolder.appendingPathComponent("当前错题知识点.docx")
+        try KnowledgeDocumentWriter.write(
+            records: allRecords,
+            kind: .allKnowledge(updatedAt: now),
+            to: allOutput
+        )
+        try KnowledgeDocumentWriter.write(
+            records: wrongRecords,
+            kind: .currentWrong(updatedAt: now),
+            to: wrongOutput
+        )
+        print("全部知识点源题数：\(allRecords.count)")
+        print("当前错题知识点源题数：\(wrongRecords.count)")
+        print("全部知识点：\(allOutput.path)")
+        print("错题知识点：\(wrongOutput.path)")
+        exit(EXIT_SUCCESS)
+    } catch {
+        FileHandle.standardError.write(Data("生成知识点失败：\(error.localizedDescription)\n".utf8))
+        exit(EXIT_FAILURE)
+    }
+} else if CommandLine.arguments.contains("--organize-now") {
     do {
         let report = try WrongQuestionOrganizer().run()
         print(report.summary)
