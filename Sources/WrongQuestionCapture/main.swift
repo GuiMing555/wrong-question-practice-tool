@@ -67,7 +67,8 @@ final class AppController: NSObject, NSApplicationDelegate {
     private var settingsWindowController: SettingsWindowController?
     private var apiSettingsWindowController: APISettingsWindowController?
     private var progressWindowController: OrganizeProgressWindowController?
-    private var didShowScreenCaptureGuidance = false
+    private var fullPageRenderer: BrowserFullPageRenderer?
+    private var captureIsRunning = false
     private var singleInstanceLock: SingleInstanceLock?
     private var activationObserver: NSObjectProtocol?
     private var shouldRun = true
@@ -107,6 +108,8 @@ final class AppController: NSObject, NSApplicationDelegate {
         registerGlobalHotKeys()
         installRightShiftMonitor()
         refreshAccessibilityPermission(requestOnceIfNeeded: true)
+        _ = try? CaptureDiagnosticLogger.ensureLogFile()
+        CaptureDiagnosticLogger.record(.info, event: "application_started")
         try? synchronizeWorkbookOutputPaths(exportImmediately: true)
         _ = try? synchronizeLocalSchedule(showErrors: false)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
@@ -202,6 +205,13 @@ final class AppController: NSObject, NSApplicationDelegate {
         )
         openFolderItem.target = self
         menu.addItem(openFolderItem)
+        let openCaptureLogItem = NSMenuItem(
+            title: "打开采集日志",
+            action: #selector(openCaptureLog),
+            keyEquivalent: ""
+        )
+        openCaptureLogItem.target = self
+        menu.addItem(openCaptureLogItem)
         let organizeItem = NSMenuItem(
             title: "立即整理题本",
             action: #selector(organizeNow),
@@ -388,7 +398,12 @@ final class AppController: NSObject, NSApplicationDelegate {
     }
 
     @objc private func captureTargetWindow() {
+        guard !captureIsRunning else {
+            CaptureDiagnosticLogger.record(.warning, event: "capture_ignored_already_running")
+            return
+        }
         guard let targetWindow else {
+            CaptureDiagnosticLogger.record(.warning, event: "capture_failed_no_target")
             showAlert(
                 title: "尚未指定窗口",
                 message: "先让题库窗口位于最前面，然后按 Control + Option + Shift + 1；以后使用“\(settings.captureShortcut.title)”截图。"
@@ -397,6 +412,7 @@ final class AppController: NSObject, NSApplicationDelegate {
         }
 
         guard windowStillExists(targetWindow.id) else {
+            CaptureDiagnosticLogger.record(.warning, event: "capture_failed_target_closed")
             self.targetWindow = nil
             targetDescriptionItem.title = "目标：窗口已关闭，请重新设置"
             statusItem.button?.title = "!"
@@ -404,64 +420,157 @@ final class AppController: NSObject, NSApplicationDelegate {
             return
         }
 
-        let pageText = BrowserWindowSnapshotReader().readPageText(
+        captureIsRunning = true
+        statusItem.button?.title = "…"
+        let reader = BrowserWindowSnapshotReader()
+        let readResult = reader.readPageTextCandidates(
             ownerPID: targetWindow.ownerPID,
             windowTitle: targetWindow.title,
             bounds: targetWindow.bounds
         )
-        if let pageText,
-           WrongQuestionOrganizer().pageSnapshotIsUsable(pageText) {
+        let organizer = WrongQuestionOrganizer()
+        let evaluated = readResult.candidates.map { candidate in
+            (candidate, organizer.pageSnapshotValidation(candidate.text))
+        }
+        for item in evaluated {
+            CaptureDiagnosticLogger.record(
+                item.1.isUsable ? .info : .warning,
+                event: "page_text_candidate_evaluated",
+                fields: [
+                    "source": item.0.source.rawValue,
+                    "characters": String(item.0.text.count),
+                    "usable": String(item.1.isUsable),
+                    "question_characters": String(item.1.questionCharacterCount),
+                    "options": String(item.1.optionCount),
+                    "explanation_characters": String(item.1.explanationCharacterCount),
+                    "reasons": item.1.reasons.joined(separator: "；")
+                ]
+            )
+        }
+        for diagnostic in readResult.diagnostics {
+            CaptureDiagnosticLogger.record(
+                .warning,
+                event: "page_text_reader_diagnostic",
+                fields: ["reason": diagnostic]
+            )
+        }
+
+        if let accepted = evaluated.first(where: { $0.1.isUsable }) {
             do {
-                let outputURL = try save(pageText: pageText, target: targetWindow)
+                let outputURL = try save(pageText: accepted.0.text, target: targetWindow)
                 lastCaptureItem.title = "最近页面数据：\(outputURL.lastPathComponent)"
                 statusItem.button?.title = "✓"
+                captureIsRunning = false
+                CaptureDiagnosticLogger.record(
+                    .info,
+                    event: "page_text_saved",
+                    fields: [
+                        "source": accepted.0.source.rawValue,
+                        "characters": String(accepted.0.text.count),
+                        "file": outputURL.lastPathComponent
+                    ]
+                )
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(outputURL.path, forType: .string)
                 NSSound(named: "Pop")?.play()
             } catch {
+                captureIsRunning = false
+                statusItem.button?.title = "!"
+                CaptureDiagnosticLogger.record(
+                    .error,
+                    event: "page_text_save_failed",
+                    fields: ["reason": error.localizedDescription]
+                )
                 showAlert(title: "保存失败", message: error.localizedDescription)
             }
             return
         }
 
-        if !CapturePermissionManager.screenCaptureGranted {
-            let didRequestPermission = CapturePermissionManager.requestScreenCaptureOnceIfNeeded()
-            if !CapturePermissionManager.screenCaptureGranted {
-                lastCaptureItem.title = "页面数据不完整，屏幕录制权限未开启"
-                statusItem.button?.title = "!"
-                if !didRequestPermission && !didShowScreenCaptureGuidance {
-                    didShowScreenCaptureGuidance = true
-                    showAlert(
-                        title: "需要屏幕录制权限",
-                        message: "本次直接读取的页面数据不完整，需要回退保存窗口图像。请从菜单或设置页点击“检查系统权限…”，授权后重新启动。"
-                    )
-                }
-                return
-            }
-        }
-
-        guard let image = CGWindowListCreateImage(
-            .null,
-            .optionIncludingWindow,
-            targetWindow.id,
-            [.boundsIgnoreFraming, .bestResolution]
-        ) else {
-            showAlert(
-                title: "截图失败",
-                message: "请确认目标窗口未最小化，并检查屏幕录制权限。"
-            )
-            return
-        }
-
+        CaptureDiagnosticLogger.record(
+            .warning,
+            event: "page_text_all_candidates_rejected",
+            fields: [
+                "candidate_count": String(evaluated.count),
+                "reader_diagnostics": readResult.diagnostics.joined(separator: "；")
+            ]
+        )
         do {
-            let outputURL = try save(image: image, target: targetWindow)
-            lastCaptureItem.title = "页面数据不完整，已回退保存窗口图像"
-            statusItem.button?.title = "!"
-            NSPasteboard.general.clearContents()
-            NSPasteboard.general.setString(outputURL.path, forType: .string)
-            NSSound(named: "Pop")?.play()
+            let archive = try reader.readPageArchive(windowTitle: targetWindow.title)
+            let renderer = BrowserFullPageRenderer()
+            fullPageRenderer = renderer
+            lastCaptureItem.title = "页面文字不完整，正在离屏生成整页长图…"
+            renderer.render(
+                archive: archive,
+                viewportWidth: targetWindow.bounds.width
+            ) { [weak self] result in
+                self?.finishFullPageCapture(result, targetWindow: targetWindow)
+            }
+            CaptureDiagnosticLogger.record(
+                .info,
+                event: "full_page_render_started",
+                fields: ["html_characters": String(archive.html.count)]
+            )
         } catch {
-            showAlert(title: "保存失败", message: error.localizedDescription)
+            captureIsRunning = false
+            statusItem.button?.title = "!"
+            lastCaptureItem.title = "页面文字和整页长图均保存失败"
+            CaptureDiagnosticLogger.record(
+                .error,
+                event: "full_page_archive_failed",
+                fields: ["reason": error.localizedDescription]
+            )
+            showAlert(
+                title: "采集失败",
+                message: "页面文字不完整，整页长图也无法生成。程序没有保存残缺的可见区域截图。\n\n原因：\(error.localizedDescription)\n\n日志：\(CaptureDiagnosticLogger.logURL.path)"
+            )
+        }
+    }
+
+    private func finishFullPageCapture(
+        _ result: Result<CGImage, Error>,
+        targetWindow: TargetWindow
+    ) {
+        captureIsRunning = false
+        fullPageRenderer = nil
+        switch result {
+        case .success(let image):
+            do {
+                let outputURL = try save(image: image, target: targetWindow)
+                lastCaptureItem.title = "页面文字不完整，已保存整页长图"
+                statusItem.button?.title = "!"
+                CaptureDiagnosticLogger.record(
+                    .warning,
+                    event: "full_page_image_saved",
+                    fields: [
+                        "width": String(image.width),
+                        "height": String(image.height),
+                        "file": outputURL.lastPathComponent
+                    ]
+                )
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(outputURL.path, forType: .string)
+                NSSound(named: "Pop")?.play()
+            } catch {
+                statusItem.button?.title = "!"
+                CaptureDiagnosticLogger.record(
+                    .error,
+                    event: "full_page_image_save_failed",
+                    fields: ["reason": error.localizedDescription]
+                )
+                showAlert(title: "长图保存失败", message: error.localizedDescription)
+            }
+        case .failure(let error):
+            lastCaptureItem.title = "页面文字和整页长图均保存失败"
+            statusItem.button?.title = "!"
+            CaptureDiagnosticLogger.record(
+                .error,
+                event: "full_page_render_failed",
+                fields: ["reason": error.localizedDescription]
+            )
+            showAlert(
+                title: "整页长图生成失败",
+                message: "程序没有保存残缺的可见区域截图。\n\n原因：\(error.localizedDescription)\n\n日志：\(CaptureDiagnosticLogger.logURL.path)"
+            )
         }
     }
 
@@ -582,6 +691,15 @@ final class AppController: NSObject, NSApplicationDelegate {
             NSWorkspace.shared.open(try captureRootFolder())
         } catch {
             showAlert(title: "无法打开文件夹", message: error.localizedDescription)
+        }
+    }
+
+    @objc private func openCaptureLog() {
+        do {
+            let logURL = try CaptureDiagnosticLogger.ensureLogFile()
+            NSWorkspace.shared.activateFileViewerSelecting([logURL])
+        } catch {
+            showAlert(title: "无法打开采集日志", message: error.localizedDescription)
         }
     }
 
@@ -718,13 +836,12 @@ final class AppController: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         let needsAccessibility = settings.captureShortcut == .rightShift
         let accessibilityGranted = CapturePermissionManager.accessibilityGranted
-        let screenCaptureGranted = CapturePermissionManager.screenCaptureGranted
 
         let alert = NSAlert()
         alert.messageText = "系统权限"
         alert.informativeText = [
             "辅助功能（右 Shift 快捷键）：\(needsAccessibility ? (accessibilityGranted ? "已开启" : "未开启") : "当前快捷键不需要")",
-            "屏幕与系统音频录制：\(screenCaptureGranted ? "已开启" : "未开启")",
+            "整页长图：由应用内部隐藏页面生成，不需要屏幕录制权限",
             "程序不会再在每次保存设置时重复申请权限。"
         ].joined(separator: "\n")
         alert.alertStyle = .informational
@@ -735,13 +852,6 @@ final class AppController: NSObject, NSApplicationDelegate {
             actions.append {
                 CapturePermissionManager.requestAccessibility()
                 CapturePermissionManager.openAccessibilitySettings()
-            }
-        }
-        if !screenCaptureGranted {
-            alert.addButton(withTitle: "打开屏幕录制设置")
-            actions.append {
-                CapturePermissionManager.requestScreenCapture()
-                CapturePermissionManager.openScreenCaptureSettings()
             }
         }
         alert.addButton(withTitle: "关闭")
@@ -830,6 +940,70 @@ if let argument = CommandLine.arguments.first(where: {
     }
     print(parseSnapshot ? WrongQuestionOrganizer().diagnosticParsedSnapshot(snapshot) : snapshot)
     exit(EXIT_SUCCESS)
+} else if CommandLine.arguments.contains("--self-test-capture-log") {
+    CaptureDiagnosticLogger.record(
+        .info,
+        event: "capture_log_self_test",
+        fields: ["contains_page_text": "false", "contains_secret": "false"]
+    )
+    CaptureDiagnosticLogger.flush()
+    print(CaptureDiagnosticLogger.logURL.path)
+    exit(EXIT_SUCCESS)
+} else if let argument = CommandLine.arguments.first(where: {
+    $0.hasPrefix("--self-test-full-page-render=")
+}) {
+    let outputPath = argument.replacingOccurrences(of: "--self-test-full-page-render=", with: "")
+    guard !outputPath.isEmpty else {
+        FileHandle.standardError.write(Data("必须提供长图自测输出路径。\n".utf8))
+        exit(EXIT_FAILURE)
+    }
+    _ = NSApplication.shared
+    let archive = BrowserPageArchive(
+        pageURL: URL(string: "https://example.invalid/")!,
+        html: """
+        <!doctype html>
+        <html><head><meta charset="utf-8"><style>
+        html, body { margin: 0; font-family: -apple-system; }
+        section { height: 1100px; padding: 40px; box-sizing: border-box; font-size: 32px; }
+        .first { background: #fff4f4; } .middle { background: #f4fff4; } .last { background: #f4f4ff; }
+        </style></head><body>
+        <section class="first">整页长图自测：顶部</section>
+        <section class="middle">整页长图自测：中部</section>
+        <section class="last">整页长图自测：底部</section>
+        </body></html>
+        """
+    )
+    let renderer = BrowserFullPageRenderer()
+    var finished = false
+    var exitCode = EXIT_FAILURE
+    renderer.render(archive: archive, viewportWidth: 900) { result in
+        defer { finished = true }
+        switch result {
+        case .success(let image):
+            let bitmap = NSBitmapImageRep(cgImage: image)
+            guard let data = bitmap.representation(using: .png, properties: [:]) else {
+                FileHandle.standardError.write(Data("长图自测无法编码 PNG。\n".utf8))
+                return
+            }
+            do {
+                try data.write(to: URL(fileURLWithPath: outputPath), options: .atomic)
+                print("full_page_render_size=\(image.width)x\(image.height)")
+                exitCode = image.height > 2_000 ? EXIT_SUCCESS : EXIT_FAILURE
+            } catch {
+                FileHandle.standardError.write(Data("长图自测保存失败：\(error.localizedDescription)\n".utf8))
+            }
+        case .failure(let error):
+            FileHandle.standardError.write(Data("长图自测失败：\(error.localizedDescription)\n".utf8))
+        }
+    }
+    let deadline = Date().addingTimeInterval(20)
+    while !finished, Date() < deadline {
+        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+    }
+    if !finished {
+        FileHandle.standardError.write(Data("长图自测超时。\n".utf8))
+    }
+    exit(exitCode)
 } else if CommandLine.arguments.contains("--repair-pending-explanations-once") {
     do {
         let report = try WrongQuestionOrganizer().run(mode: .repairPendingExplanationsOnce)

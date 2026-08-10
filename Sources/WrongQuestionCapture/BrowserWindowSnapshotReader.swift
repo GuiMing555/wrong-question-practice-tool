@@ -3,24 +3,200 @@ import ApplicationServices
 import CoreGraphics
 import Foundation
 
+enum BrowserPageTextSource: String {
+    case chromeDOM = "chrome_dom"
+    case accessibility = "accessibility"
+}
+
+struct BrowserPageTextCandidate {
+    let source: BrowserPageTextSource
+    let text: String
+}
+
+struct BrowserPageReadResult {
+    let candidates: [BrowserPageTextCandidate]
+    let diagnostics: [String]
+}
+
+struct BrowserPageArchive {
+    let pageURL: URL
+    let html: String
+}
+
 struct BrowserWindowSnapshotReader {
     private let maximumVisitedNodes = 30_000
     private let maximumCharacters = 500_000
+    private let maximumArchiveCharacters = 15_000_000
 
     func readPageText(ownerPID: pid_t, windowTitle: String, bounds: CGRect) -> String? {
-        guard AXIsProcessTrusted() else { return nil }
-        let application = AXUIElementCreateApplication(ownerPID)
-        guard let window = matchingWindow(
-            in: application,
-            targetTitle: windowTitle,
-            targetBounds: bounds
-        ), let document = firstDocument(in: window) else { return nil }
+        readPageTextCandidates(
+            ownerPID: ownerPID,
+            windowTitle: windowTitle,
+            bounds: bounds
+        ).candidates.first?.text
+    }
 
-        let domText = directChromeDOMText(windowTitle: windowTitle)
-        let accessibilityText = accessibilitySnapshot(from: document)
-        return [domText, accessibilityText]
-            .compactMap { $0 }
-            .max(by: { $0.count < $1.count })
+    func readPageTextCandidates(
+        ownerPID: pid_t,
+        windowTitle: String,
+        bounds: CGRect
+    ) -> BrowserPageReadResult {
+        var candidates: [BrowserPageTextCandidate] = []
+        var diagnostics: [String] = []
+
+        do {
+            let value = try executeChromeJavaScript(
+                windowTitle: windowTitle,
+                javaScript: "document.documentElement.innerText"
+            ).trimmingCharacters(in: .whitespacesAndNewlines)
+            if value.count >= 20, value.count <= maximumCharacters {
+                candidates.append(BrowserPageTextCandidate(source: .chromeDOM, text: value))
+            } else {
+                diagnostics.append("chrome_dom 字符数异常：\(value.count)")
+            }
+        } catch {
+            diagnostics.append("chrome_dom 读取失败：\(error.localizedDescription)")
+        }
+
+        if AXIsProcessTrusted() {
+            let application = AXUIElementCreateApplication(ownerPID)
+            if let window = matchingWindow(
+                in: application,
+                targetTitle: windowTitle,
+                targetBounds: bounds
+            ), let document = firstDocument(in: window) {
+                if let text = accessibilitySnapshot(from: document) {
+                    if !candidates.contains(where: { $0.text == text }) {
+                        candidates.append(BrowserPageTextCandidate(source: .accessibility, text: text))
+                    }
+                } else {
+                    diagnostics.append("accessibility 没有读取到足够文字")
+                }
+            } else {
+                diagnostics.append("accessibility 未找到匹配的浏览器文档")
+            }
+        } else {
+            diagnostics.append("accessibility 权限未开启")
+        }
+
+        return BrowserPageReadResult(candidates: candidates, diagnostics: diagnostics)
+    }
+
+    func readPageArchive(windowTitle: String) throws -> BrowserPageArchive {
+        let javaScript = #"""
+        (() => {
+          const clone = document.documentElement.cloneNode(true);
+          const styleProperties = [
+            'display', 'position', 'top', 'right', 'bottom', 'left', 'z-index',
+            'box-sizing', 'width', 'min-width', 'max-width', 'height', 'min-height', 'max-height',
+            'margin-top', 'margin-right', 'margin-bottom', 'margin-left',
+            'padding-top', 'padding-right', 'padding-bottom', 'padding-left',
+            'border-top-width', 'border-right-width', 'border-bottom-width', 'border-left-width',
+            'border-top-style', 'border-right-style', 'border-bottom-style', 'border-left-style',
+            'border-top-color', 'border-right-color', 'border-bottom-color', 'border-left-color',
+            'border-radius', 'background-color', 'color', 'font-family', 'font-size',
+            'font-weight', 'font-style', 'line-height', 'letter-spacing', 'text-align',
+            'text-indent', 'text-decoration', 'white-space', 'word-break', 'overflow-wrap',
+            'overflow-x', 'overflow-y', 'opacity', 'visibility', 'transform', 'transform-origin',
+            'flex', 'flex-basis', 'flex-direction', 'flex-grow', 'flex-shrink', 'flex-wrap',
+            'align-content', 'align-items', 'align-self', 'justify-content', 'justify-items',
+            'justify-self', 'gap', 'row-gap', 'column-gap', 'grid-template-columns',
+            'grid-template-rows', 'grid-column', 'grid-row', 'list-style', 'table-layout',
+            'border-collapse', 'vertical-align', 'object-fit'
+          ];
+          const originalElements = [document.documentElement, ...document.documentElement.querySelectorAll('*')];
+          const clonedElements = [clone, ...clone.querySelectorAll('*')];
+          originalElements.forEach((source, index) => {
+            const target = clonedElements[index];
+            if (!target) return;
+            const computed = getComputedStyle(source);
+            target.removeAttribute('style');
+            target.setAttribute('style', styleProperties.map(property => {
+              return property + ':' + computed.getPropertyValue(property);
+            }).join(';'));
+            const position = computed.getPropertyValue('position');
+            if (position === 'fixed' || position === 'sticky') {
+              target.style.visibility = 'hidden';
+            }
+            if (source.scrollHeight > source.clientHeight + 2) {
+              target.style.height = source.scrollHeight + 'px';
+              target.style.maxHeight = 'none';
+              target.style.overflowY = 'visible';
+            }
+            if (source.scrollWidth > source.clientWidth + 2) {
+              target.style.width = source.scrollWidth + 'px';
+              target.style.maxWidth = 'none';
+              target.style.overflowX = 'visible';
+            }
+          });
+          const originalControls = Array.from(document.querySelectorAll('input, textarea, select'));
+          const clonedControls = Array.from(clone.querySelectorAll('input, textarea, select'));
+          originalControls.forEach((source, index) => {
+            const target = clonedControls[index];
+            if (!target) return;
+            if (source instanceof HTMLTextAreaElement) {
+              target.textContent = source.value;
+            } else if (source instanceof HTMLSelectElement) {
+              Array.from(target.options).forEach((option, optionIndex) => {
+                option.selected = source.options[optionIndex]?.selected === true;
+              });
+            } else {
+              target.setAttribute('value', source.value || '');
+              if (source.checked) target.setAttribute('checked', 'checked');
+              else target.removeAttribute('checked');
+            }
+          });
+          clone.querySelectorAll('script, noscript, style, link, iframe, object, embed, video, audio, source').forEach(node => node.remove());
+          clone.querySelectorAll('meta[http-equiv="Content-Security-Policy"], meta[http-equiv="refresh"]').forEach(node => node.remove());
+          clone.querySelectorAll('[src], [srcset], [poster], [background], [data]').forEach(node => {
+            node.removeAttribute('src');
+            node.removeAttribute('srcset');
+            node.removeAttribute('poster');
+            node.removeAttribute('background');
+            node.removeAttribute('data');
+          });
+          clone.querySelectorAll('img').forEach(node => {
+            node.setAttribute('src', 'data:image/gif;base64,R0lGODlhAQABAAD/ACwAAAAAAQABAAACADs=');
+          });
+          clone.querySelectorAll('image').forEach(node => {
+            node.removeAttribute('href');
+            node.removeAttribute('xlink:href');
+          });
+          clone.style.height = 'auto';
+          clone.style.overflow = 'visible';
+          const clonedBody = clone.querySelector('body');
+          if (clonedBody) {
+            clonedBody.style.height = 'auto';
+            clonedBody.style.overflow = 'visible';
+          }
+          return JSON.stringify({
+            pageURL: location.href,
+            html: '<!doctype html>\n' + clone.outerHTML
+          });
+        })()
+        """#
+        let value = try executeChromeJavaScript(windowTitle: windowTitle, javaScript: javaScript)
+        guard value.count <= maximumArchiveCharacters else {
+            throw NSError(
+                domain: "BrowserWindowSnapshotReader",
+                code: 21,
+                userInfo: [NSLocalizedDescriptionKey: "页面镜像超过 15 MB，已停止生成长图。"]
+            )
+        }
+        guard let data = value.data(using: .utf8),
+              let object = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rawURL = object["pageURL"] as? String,
+              let pageURL = URL(string: rawURL),
+              let html = object["html"] as? String,
+              !html.isEmpty
+        else {
+            throw NSError(
+                domain: "BrowserWindowSnapshotReader",
+                code: 22,
+                userInfo: [NSLocalizedDescriptionKey: "浏览器返回的页面镜像格式无效。"]
+            )
+        }
+        return BrowserPageArchive(pageURL: pageURL, html: html)
     }
 
     private func accessibilitySnapshot(from document: AXUIElement) -> String? {
@@ -58,27 +234,37 @@ struct BrowserWindowSnapshotReader {
         return text.count >= 20 ? text : nil
     }
 
-    private func directChromeDOMText(windowTitle: String) -> String? {
+    private func executeChromeJavaScript(windowTitle: String, javaScript: String) throws -> String {
         let escapedTitle = windowTitle
             .replacingOccurrences(of: "\\", with: "\\\\")
             .replacingOccurrences(of: "\"", with: "\\\"")
             .replacingOccurrences(of: "\n", with: " ")
+        let escapedJavaScript = javaScript
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "\"", with: "\\\"")
+            .replacingOccurrences(of: "\r", with: "\\r")
+            .replacingOccurrences(of: "\n", with: "\\n")
         let source = """
         tell application "Google Chrome"
             repeat with candidateWindow in windows
                 set candidateTitle to title of active tab of candidateWindow
                 if candidateTitle is "\(escapedTitle)" or candidateTitle contains "\(escapedTitle)" or "\(escapedTitle)" contains candidateTitle then
-                    return execute active tab of candidateWindow javascript "document.documentElement.innerText"
+                    return execute active tab of candidateWindow javascript "\(escapedJavaScript)"
                 end if
             end repeat
+            error "没有找到标题匹配的 Chrome 标签页。"
         end tell
         """
         var error: NSDictionary?
-        guard let value = NSAppleScript(source: source)?.executeAndReturnError(&error).stringValue else {
-            return nil
+        guard let descriptor = NSAppleScript(source: source)?.executeAndReturnError(&error) else {
+            let message = (error?[NSAppleScript.errorMessage] as? String) ?? "Chrome 页面脚本执行失败。"
+            throw NSError(
+                domain: "BrowserWindowSnapshotReader",
+                code: 20,
+                userInfo: [NSLocalizedDescriptionKey: message]
+            )
         }
-        let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return normalized.count >= 20 && normalized.count <= maximumCharacters ? normalized : nil
+        return descriptor.stringValue ?? ""
     }
 
     private func matchingWindow(

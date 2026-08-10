@@ -135,6 +135,15 @@ private struct ParsedQuestion {
     var userAnswer: String
     var explanation: String
     var needsReview: Bool
+    var reviewReasons: [String]
+}
+
+struct PageSnapshotValidation {
+    let isUsable: Bool
+    let reasons: [String]
+    let questionCharacterCount: Int
+    let optionCount: Int
+    let explanationCharacterCount: Int
 }
 
 private struct ContentProcessingReport {
@@ -1186,9 +1195,26 @@ final class WrongQuestionOrganizer {
             isSuspiciousFentiStem(question, hasQuestionMarker: hasQuestionMarker)
         let suspiciousFentiOptions = recognitionMode == .fentiQuestionBank &&
             options.contains(where: isSuspiciousFentiOption)
-        let needsReview = question.hasPrefix("[OCR") || options.count < minimumOptions ||
-            (!isEssayQuestion && correctAnswer == "待校对") || explanation.hasPrefix("待人工补充") ||
-            suspiciousFentiStem || suspiciousFentiOptions
+        var reviewReasons: [String] = []
+        if question.hasPrefix("[OCR") {
+            reviewReasons.append("未识别到可靠题干")
+        }
+        if options.count < minimumOptions {
+            reviewReasons.append("选项不完整：识别到 \(options.count) 个，至少需要 \(minimumOptions) 个")
+        }
+        if !isEssayQuestion && correctAnswer == "待校对" {
+            reviewReasons.append("未识别到客观题正确答案")
+        }
+        if explanation.hasPrefix("待人工补充") {
+            reviewReasons.append("未识别到参考答案或解析")
+        }
+        if suspiciousFentiStem {
+            reviewReasons.append("题干包含页面残留或结构异常")
+        }
+        if suspiciousFentiOptions {
+            reviewReasons.append("选项包含标签粘连或页面残留")
+        }
+        let needsReview = !reviewReasons.isEmpty
 
         return ParsedQuestion(
             question: question,
@@ -1196,7 +1222,8 @@ final class WrongQuestionOrganizer {
             correctAnswer: correctAnswer,
             userAnswer: userAnswer,
             explanation: explanation,
-            needsReview: needsReview
+            needsReview: needsReview,
+            reviewReasons: reviewReasons
         )
     }
 
@@ -1207,7 +1234,8 @@ final class WrongQuestionOrganizer {
             "options": parsed.options,
             "correctAnswer": parsed.correctAnswer,
             "explanation": parsed.explanation,
-            "needsReview": parsed.needsReview
+            "needsReview": parsed.needsReview,
+            "reviewReasons": parsed.reviewReasons
         ]
         guard let data = try? JSONSerialization.data(
             withJSONObject: object,
@@ -1217,10 +1245,18 @@ final class WrongQuestionOrganizer {
     }
 
     func pageSnapshotIsUsable(_ rawText: String) -> Bool {
+        pageSnapshotValidation(rawText).isUsable
+    }
+
+    func pageSnapshotValidation(_ rawText: String) -> PageSnapshotValidation {
         let parsed = parse(rawText: rawText, recognitionMode: .fentiQuestionBank)
-        return !parsed.needsReview &&
-            !parsed.question.hasPrefix("[OCR") &&
-            !parsed.explanation.hasPrefix("待人工补充")
+        return PageSnapshotValidation(
+            isUsable: !parsed.needsReview,
+            reasons: parsed.reviewReasons,
+            questionCharacterCount: parsed.question.count,
+            optionCount: parsed.options.count,
+            explanationCharacterCount: parsed.explanation.count
+        )
     }
 
     /// 焚题库的“全选复制”顺序与视觉顺序不同：统计和解析在题型标记之前，

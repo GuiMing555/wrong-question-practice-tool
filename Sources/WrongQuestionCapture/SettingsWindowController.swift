@@ -63,7 +63,7 @@ final class SettingsWindowController: NSWindowController {
 
         let heading = NSTextField(labelWithString: "截图与题本设置")
         heading.font = .systemFont(ofSize: 22, weight: .semibold)
-        let intro = NSTextField(wrappingLabelWithString: "绑定浏览器窗口后，快捷键会直接读取当前标签页的页面数据。题干、选项、答案和解析校验通过时只保存文字，不生成图片；只有数据不完整时才回退截图和 OCR。全部处理均在本机完成。")
+        let intro = NSTextField(wrappingLabelWithString: "绑定浏览器窗口后，快捷键会直接读取当前标签页的页面数据。校验通过时只保存文字；数据不完整时只读复制页面结构，并在应用内部隐藏页面中生成整页长图，不滚动、不切换也不刷新正在做题的浏览器。全部处理均在本机完成。")
         intro.textColor = .secondaryLabelColor
 
         shortcutPopup.addItems(withTitles: CaptureShortcut.allCases.map(\.title))
@@ -84,7 +84,7 @@ final class SettingsWindowController: NSWindowController {
 
         let shortcutLabel = NSTextField(labelWithString: "截图快捷键")
         shortcutLabel.font = .systemFont(ofSize: 13, weight: .medium)
-        let targetHint = NSTextField(wrappingLabelWithString: "设定目标窗口的快捷键固定为 Control + Option + Shift + 1。绑定 Chrome 题库窗口后，单独轻点右 Shift 会直接读取并校验标签页数据；通过时只写入小型文字文件，不改变页面焦点、选区或剪贴板。")
+        let targetHint = NSTextField(wrappingLabelWithString: "设定目标窗口的快捷键固定为 Control + Option + Shift + 1。绑定 Chrome 题库窗口后，单独轻点右 Shift 会直接读取并校验标签页数据；不会滚动页面或改变焦点。采集失败原因记录在“采集日志”，不写入题目正文或访问密钥。")
         targetHint.textColor = .secondaryLabelColor
         targetHint.font = .systemFont(ofSize: 11)
         let permissionsButton = NSButton(
