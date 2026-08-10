@@ -38,7 +38,8 @@ let package = Package(
                 .linkedFramework("Carbon"),
                 .linkedFramework("CoreGraphics"),
                 .linkedFramework("Vision"),
-                .linkedFramework("ImageIO")
+                .linkedFramework("ImageIO"),
+                .linkedFramework("WebKit")
             ]
         ),
         .executableTarget(
