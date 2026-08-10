@@ -3,15 +3,15 @@ set -euo pipefail
 
 MODE="${1:-run}"
 MIN_SYSTEM_VERSION="13.0"
-APP_VERSION="${APP_VERSION:-1.3.0}"
-APP_BUILD_NUMBER="${APP_BUILD_NUMBER:-38}"
+APP_VERSION="${APP_VERSION:-1.3.1}"
+APP_BUILD_NUMBER="${APP_BUILD_NUMBER:-39}"
 
 CAPTURE_PRODUCT="WrongQuestionDailyOrganizer"
 CAPTURE_DISPLAY_NAME="错题每日自动化整理"
 CAPTURE_BUNDLE_ID="com.guiming.wrong-question-daily-organizer"
 
 PRACTICE_PRODUCT="MedicalQuestionPractice"
-PRACTICE_DISPLAY_NAME="考试题本练习"
+PRACTICE_DISPLAY_NAME="错题刷题工具"
 PRACTICE_BUNDLE_ID="com.guiming.medical-question-practice"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

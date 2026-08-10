@@ -6,7 +6,7 @@
     <UseWPF>true</UseWPF>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <AssemblyName>医学综合练习</AssemblyName>
+    <AssemblyName>错题刷题工具</AssemblyName>
     <RootNamespace>MedicalQuestionPractice.Windows</RootNamespace>
   </PropertyGroup>
 

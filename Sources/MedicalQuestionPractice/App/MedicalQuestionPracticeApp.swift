@@ -6,7 +6,7 @@ struct MedicalQuestionPracticeApp: App {
     @StateObject private var store = PracticeAppStore()
 
     var body: some Scene {
-        WindowGroup("考试题本练习") {
+        WindowGroup("错题刷题工具") {
             ContentView(store: store)
         }
         .defaultSize(width: 980, height: 720)

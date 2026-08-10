@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION="${1:-1.3.0}"
+VERSION="${1:-1.3.1}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 DIST_DIR="$ROOT_DIR/dist"
 CAPTURE_APP="$DIST_DIR/错题每日自动化整理.app"
-PRACTICE_APP="$DIST_DIR/考试题本练习.app"
-OUTPUT="$DIST_DIR/medical-wrong-question-suite-macOS-arm64-v$VERSION.dmg"
-STAGING_DIR="$(mktemp -d /private/tmp/medical-question-dmg.XXXXXX)"
+PRACTICE_APP="$DIST_DIR/错题刷题工具.app"
+OUTPUT="$DIST_DIR/wrong-question-practice-tool-macOS-arm64-v$VERSION.dmg"
+STAGING_DIR="$(mktemp -d /private/tmp/wrong-question-practice-dmg.XXXXXX)"
 
 cleanup() {
   rm -rf "$STAGING_DIR"
@@ -22,11 +22,11 @@ fi
 APP_VERSION="$VERSION" "$ROOT_DIR/script/build_and_run.sh" --build-only
 
 /usr/bin/ditto "$CAPTURE_APP" "$STAGING_DIR/错题每日自动化整理.app"
-/usr/bin/ditto "$PRACTICE_APP" "$STAGING_DIR/考试题本练习.app"
+/usr/bin/ditto "$PRACTICE_APP" "$STAGING_DIR/错题刷题工具.app"
 /bin/ln -s /Applications "$STAGING_DIR/Applications"
 
 /usr/bin/hdiutil create \
-  -volname "医学题本与错题练习 $VERSION" \
+  -volname "错题刷题工具 $VERSION" \
   -srcfolder "$STAGING_DIR" \
   -ov \
   -format UDZO \

@@ -1,13 +1,13 @@
-# 考试题本与错题循环练习工具
+# 错题刷题工具
 
 这个项目源于实际刷题时遇到的问题：一些已经购买的题库没有完善的错题重复练习逻辑，也不支持将错题导出保存。工具把截图识别、整理出的完整练习集合称为“题本”；只有在练习应用中实际答错或点击“我不会”的题目才进入“错题本”。
 
 项目由两个独立应用组成。升学考试题本与截图整理工具联动；公务员考试使用单独的人工录入题库，不读取截图数据库：
 
 - **错题每日自动化整理**：截取指定窗口，使用 macOS Vision 识别文字，整理完整题本工作簿，并可按设置生成可打印的 Word 文档。
-- **考试题本练习**：主界面提供升学考试和公务员考试入口，按科目或行测分类进行普通练习和错题练习；逐题保存作答状态，中途退出时自动结束本轮练习。
+- **错题刷题工具**：主界面提供升学考试和公务员考试入口，按科目或行测分类进行普通练习和错题练习；逐题保存作答状态，中途退出时自动结束本轮练习。
 
-macOS Apple 芯片用户可从 [Latest Release](https://github.com/GuiMing555/medical-wrong-question-suite/releases/latest) 下载同时包含两款应用的最新 DMG。
+macOS Apple 芯片用户可从 [Latest Release](https://github.com/GuiMing555/wrong-question-practice-tool/releases/latest) 下载同时包含两款应用的最新 DMG。
 
 目前 macOS 版本可以构建使用。Windows 目录是早期迁移原型，尚未同步本版本功能，不能视为可用的 Windows 发行版。
 
@@ -16,6 +16,11 @@ macOS Apple 芯片用户可从 [Latest Release](https://github.com/GuiMing555/me
 当前版本主要围绕医学综合题目开发和测试，但识别、查重、导出及循环练习流程本身并不依赖特定医学知识。对于政治、法律等以固定选项的单选题、多选题和现成解析为主的科目，理论上也有适配的可能。
 
 不同题库的页面版式、选项标记和解析结构可能存在差异，目前没有对这些科目及各类平台逐一验证，因此不能保证直接使用时都能正确识别；必要时可能需要针对具体版式调整解析规则。
+
+## 1.3.1 更新内容
+
+- 项目及练习应用的对外名称统一为“错题刷题工具”。
+- 保留原有 Bundle ID 和数据库目录，升级后继续读取既有题本、错题本、作答记录和设置。
 
 ## 1.3.0 更新内容
 
@@ -66,6 +71,8 @@ macOS Apple 芯片用户可从 [Latest Release](https://github.com/GuiMing555/me
 ~/Library/Application Support/考试题本练习/英语/question-bank.sqlite3
 ~/Library/Application Support/考试题本练习/公务员考试/行测/<行测分类>/question-bank.sqlite3
 ```
+
+以上路径中的“医学综合练习”和“考试题本练习”是为兼容已有用户数据而保留的内部目录名称，不代表当前对外项目名。
 
 公务员行测题库与截图识别、自动科目分类和升学考试数据库完全隔离，五类数据库分别保存作答状态。出于题库权利和个人数据边界，公开源码与公开 DMG 不附带题目、解析或图片；只有自行提供符合导入格式的数据包后，行测入口才可实际练习。
 
@@ -126,7 +133,7 @@ CIVIL_SERVICE_BANK_SOURCE=/绝对路径/questions.jsonl ./script/build_and_run.s
 打包同时包含两款应用的 DMG：
 
 ```bash
-./script/package_dmg.sh 1.3.0
+./script/package_dmg.sh 1.3.1
 ```
 
 运行测试：
