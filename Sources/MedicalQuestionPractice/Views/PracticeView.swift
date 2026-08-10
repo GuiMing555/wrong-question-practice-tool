@@ -3,6 +3,8 @@ import SwiftUI
 struct PracticeView: View {
     @ObservedObject var store: PracticeAppStore
     @State private var selectedOptionIDs: Set<String> = []
+    @State private var typedAnswer = ""
+    @State private var excludedOptionIDsByQuestion: [String: Set<String>] = [:]
     @State private var submittedAsUnknown = false
     @State private var pageOffset: CGFloat = 0
     @State private var isPageAnimating = false
@@ -59,6 +61,7 @@ struct PracticeView: View {
         }
         .onChange(of: question?.id) { _ in
             selectedOptionIDs = displayedFeedback?.selectedOptionIDs ?? []
+            typedAnswer = displayedFeedback?.typedAnswer ?? ""
             submittedAsUnknown = displayedFeedback?.markedAsUnsure == true
         }
         .onDisappear {
@@ -78,12 +81,9 @@ struct PracticeView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 22) {
                         questionHeader(question)
-                        Text(question.stem)
-                            .font(.title3)
-                            .textSelection(.enabled)
-                            .fixedSize(horizontal: false, vertical: true)
+                        QuestionRichContentView(content: question.stem, textFont: .title3)
 
-                        options(for: question)
+                        answerArea(for: question)
 
                         if let feedback = displayedFeedback {
                             FeedbackView(feedback: feedback, question: question)
@@ -114,14 +114,23 @@ struct PracticeView: View {
             if let session {
                 Text(session.mode.title)
                     .font(.headline)
-                Label(
-                    "错题 \(store.dashboard.wrongBookQuestions)",
-                    systemImage: "exclamationmark.circle"
-                )
-                .font(.callout.weight(.medium))
-                .foregroundStyle(store.dashboard.wrongBookQuestions > 0 ? Color.red : Color.secondary)
+                if session.mode == .dynamicPlan {
+                    Label(
+                        "今日剩余 \(store.dashboard.dynamicPlan.totalRemainingToday)",
+                        systemImage: "calendar.badge.clock"
+                    )
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.secondary)
+                } else {
+                    Label(
+                        "错题 \(store.dashboard.wrongBookQuestions)",
+                        systemImage: "exclamationmark.circle"
+                    )
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(store.dashboard.wrongBookQuestions > 0 ? Color.red : Color.secondary)
+                }
                 Spacer()
-                Text("第 \(store.displayedQuestionNumber) 题，共 \(session.totalCount) 题")
+                Text("进度 \(progressPercentage(for: session))%")
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
                 ProgressView(
@@ -140,7 +149,7 @@ struct PracticeView: View {
     @ViewBuilder
     private func questionHeader(_ question: PracticeQuestion) -> some View {
         HStack(alignment: .center, spacing: 10) {
-            Text(question.allowsMultipleSelection ? "多选题" : "单选题")
+            Text(question.requiresTypedAnswer ? "论述题" : (question.allowsMultipleSelection ? "多选题" : "单选题"))
                 .font(.caption.weight(.semibold))
                 .padding(.horizontal, 8)
                 .padding(.vertical, 4)
@@ -157,10 +166,28 @@ struct PracticeView: View {
         }
     }
 
-    private func options(for question: PracticeQuestion) -> some View {
+    private func answerArea(for question: PracticeQuestion) -> some View {
         VStack(spacing: 10) {
-            ForEach(Array(question.options.enumerated()), id: \.element.id) { index, option in
-                optionRow(option, index: index, question: question)
+            if question.requiresTypedAnswer {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("作答内容")
+                        .font(.headline)
+                    TextEditor(text: $typedAnswer)
+                        .font(.body)
+                        .frame(minHeight: 220)
+                        .padding(10)
+                        .scrollContentBackground(.hidden)
+                        .background(Color(nsColor: .textBackgroundColor), in: RoundedRectangle(cornerRadius: 10))
+                        .overlay {
+                            RoundedRectangle(cornerRadius: 10)
+                                .stroke(Color.secondary.opacity(0.28), lineWidth: 1)
+                        }
+                        .disabled(displayedFeedback != nil || store.isSubmitting)
+                }
+            } else {
+                ForEach(Array(question.options.enumerated()), id: \.element.id) { index, option in
+                    optionRow(option, index: index, question: question)
+                }
             }
 
             UnknownAnswerRow(
@@ -169,6 +196,7 @@ struct PracticeView: View {
                 isSubmitting: store.isSubmitting
             ) {
                 selectedOptionIDs = []
+                typedAnswer = ""
                 submittedAsUnknown = true
                 submitCurrentAnswer([], markAsUnknown: true)
             }
@@ -177,19 +205,24 @@ struct PracticeView: View {
 
     @ViewBuilder
     private func optionRow(_ option: PracticeOption, index: Int, question: PracticeQuestion) -> some View {
-        let row = OptionRow(
+        OptionRow(
             label: optionLabel(index),
             option: option,
             isSelected: selectedOptionIDs.contains(option.id),
-            feedback: displayedFeedback
-        ) {
-            select(option.id, allowsMultiple: question.allowsMultipleSelection)
-        }
-        if index < 9 {
-            row.keyboardShortcut(KeyEquivalent(Character(String(index + 1))), modifiers: [])
-        } else {
-            row
-        }
+            isExcluded: excludedOptionIDs(for: question).contains(option.id),
+            feedback: displayedFeedback,
+            shortcut: index < 9 ? KeyEquivalent(Character(String(index + 1))) : nil,
+            selectionAction: {
+                select(
+                    option.id,
+                    questionID: question.id,
+                    allowsMultiple: question.allowsMultipleSelection
+                )
+            },
+            exclusionAction: {
+                toggleExclusion(option.id, questionID: question.id)
+            }
+        )
     }
 
     private var actionBar: some View {
@@ -212,8 +245,25 @@ struct PracticeView: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .keyboardShortcut(.return, modifiers: [])
+            } else if question?.requiresTypedAnswer == true {
+                Button {
+                    submitCurrentAnswer([], typedAnswer: typedAnswer)
+                } label: {
+                    if store.isSubmitting {
+                        HStack(spacing: 8) {
+                            ProgressView().controlSize(.small)
+                            Text("正在按解析评分…")
+                        }
+                    } else {
+                        Text("提交论述答案")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+                .keyboardShortcut(.return, modifiers: [.command])
+                .disabled(typedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || store.isSubmitting)
             } else if question?.allowsMultipleSelection == false {
-                Text("点击选项即提交")
+                Text("点击字母即提交")
                     .font(.callout.weight(.medium))
                     .foregroundStyle(.secondary)
             } else {
@@ -238,8 +288,9 @@ struct PracticeView: View {
         .background(.bar)
     }
 
-    private func select(_ optionID: String, allowsMultiple: Bool) {
+    private func select(_ optionID: String, questionID: String, allowsMultiple: Bool) {
         guard displayedFeedback == nil, !isReviewingAnswer else { return }
+        guard excludedOptionIDsByQuestion[questionID]?.contains(optionID) != true else { return }
         if allowsMultiple {
             if selectedOptionIDs.contains(optionID) {
                 selectedOptionIDs.remove(optionID)
@@ -252,16 +303,41 @@ struct PracticeView: View {
         }
     }
 
-    private func submitCurrentAnswer(_ selection: Set<String>, markAsUnknown: Bool = false) {
+    private func excludedOptionIDs(for question: PracticeQuestion) -> Set<String> {
+        excludedOptionIDsByQuestion[question.id] ?? []
+    }
+
+    private func toggleExclusion(_ optionID: String, questionID: String) {
+        guard displayedFeedback == nil, !isReviewingAnswer else { return }
+        var excluded = excludedOptionIDsByQuestion[questionID] ?? []
+        if excluded.contains(optionID) {
+            excluded.remove(optionID)
+        } else {
+            excluded.insert(optionID)
+            selectedOptionIDs.remove(optionID)
+        }
+        if excluded.isEmpty {
+            excludedOptionIDsByQuestion.removeValue(forKey: questionID)
+        } else {
+            excludedOptionIDsByQuestion[questionID] = excluded
+        }
+    }
+
+    private func submitCurrentAnswer(
+        _ selection: Set<String>,
+        typedAnswer: String? = nil,
+        markAsUnknown: Bool = false
+    ) {
         Task {
             await store.submit(
                 selectedOptionIDs: selection,
+                typedAnswer: typedAnswer,
                 markAsUnsure: markAsUnknown
             )
             if markAsUnknown, store.feedback == nil {
                 submittedAsUnknown = false
             }
-            if store.feedback?.isCorrect == true {
+            if store.feedback?.isCorrect == true, question?.requiresTypedAnswer != true {
                 store.advanceAfterFeedback()
             }
         }
@@ -276,7 +352,16 @@ struct PracticeView: View {
         if displayedFeedback != nil {
             return "本题记录已保存·触控板双指左右滑动可切换已答题"
         }
-        return "数字键 1–9 可快速选择·右滑可回看上一题"
+        if question?.requiresTypedAnswer == true {
+            return "提交后将按原解析分值逐项评分；接口成功返回后才保存作答"
+        }
+        return "点击选项文字可排除或恢复·点击字母或按数字键 1–9 作答"
+    }
+
+    private func progressPercentage(for session: PracticeSessionState) -> Int {
+        guard session.totalCount > 0 else { return 0 }
+        let ratio = Double(session.currentIndex) / Double(session.totalCount)
+        return Int((min(max(ratio, 0), 1) * 100).rounded())
     }
 
     private func updatePageOffset(_ rawOffset: CGFloat, pageWidth: CGFloat) {
@@ -381,8 +466,11 @@ private struct OptionRow: View {
     let label: String
     let option: PracticeOption
     let isSelected: Bool
+    let isExcluded: Bool
     let feedback: AnswerFeedback?
-    let action: () -> Void
+    let shortcut: KeyEquivalent?
+    let selectionAction: () -> Void
+    let exclusionAction: () -> Void
 
     private var isCorrectOption: Bool { feedback?.correctOptionIDs.contains(option.id) == true }
     private var isWrongSelection: Bool {
@@ -390,57 +478,67 @@ private struct OptionRow: View {
     }
 
     var body: some View {
-        Button(action: action) {
-            HStack(alignment: .top, spacing: 12) {
+        HStack(alignment: .center, spacing: 12) {
+            selectionControl
+
+            Button(action: exclusionAction) {
+                QuestionRichContentView(
+                    content: option.text,
+                    showsStrikethrough: isExcluded
+                )
+                    .foregroundStyle(.primary)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .opacity(isExcluded ? 0.52 : 1)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(feedback != nil)
+            .accessibilityLabel(
+                isExcluded
+                    ? "取消排除选项 \(label)，\(option.text)"
+                    : "排除选项 \(label)，\(option.text)"
+            )
+            .accessibilityHint(isExcluded ? "再次点击恢复此选项" : "点击后用横线划掉此选项")
+
+            if isCorrectOption {
+                Image(systemName: "checkmark.circle.fill")
+                    .foregroundStyle(.green)
+            } else if isWrongSelection {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.red)
+            }
+        }
+        .padding(14)
+    }
+
+    @ViewBuilder
+    private var selectionControl: some View {
+        let button = Button(action: selectionAction) {
                 Text(label)
                     .font(.callout.weight(.semibold))
                     .frame(width: 28, height: 28)
                     .background(labelBackground, in: Circle())
-                Text(option.text)
-                    .foregroundStyle(.primary)
-                    .multilineTextAlignment(.leading)
-                    .textSelection(.enabled)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-
-                if isCorrectOption {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
-                } else if isWrongSelection {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.red)
-                }
-            }
-            .padding(14)
-            .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .background(rowBackground, in: RoundedRectangle(cornerRadius: 10))
-        .overlay {
-            RoundedRectangle(cornerRadius: 10)
-                .stroke(borderColor, lineWidth: isSelected || isCorrectOption ? 1.5 : 1)
-        }
-        .disabled(feedback != nil)
-        .accessibilityLabel("\(label)，\(option.text)")
+        .disabled(feedback != nil || isExcluded)
+        .accessibilityLabel("选择选项 \(label)，\(option.text)")
         .accessibilityAddTraits(isSelected ? .isSelected : [])
+
+        if let shortcut {
+            button.keyboardShortcut(shortcut, modifiers: [])
+        } else {
+            button
+        }
     }
 
     private var labelBackground: Color {
         if isCorrectOption { return .green.opacity(0.18) }
         if isWrongSelection { return .red.opacity(0.18) }
+        if isExcluded { return .secondary.opacity(0.08) }
         return isSelected ? .accentColor.opacity(0.18) : .secondary.opacity(0.12)
     }
 
-    private var rowBackground: Color {
-        if isCorrectOption { return .green.opacity(0.08) }
-        if isWrongSelection { return .red.opacity(0.08) }
-        return isSelected ? .accentColor.opacity(0.08) : .clear
-    }
-
-    private var borderColor: Color {
-        if isCorrectOption { return .green }
-        if isWrongSelection { return .red }
-        return isSelected ? .accentColor : .secondary.opacity(0.25)
-    }
 }
 
 private struct FeedbackView: View {
@@ -449,12 +547,30 @@ private struct FeedbackView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label(
-                feedback.isCorrect ? "回答正确" : "回答错误",
-                systemImage: feedback.isCorrect ? "checkmark.circle.fill" : "xmark.circle.fill"
-            )
+            Label(feedbackTitle, systemImage: feedback.isCorrect ? "checkmark.circle.fill" : "xmark.circle.fill")
             .font(.headline)
             .foregroundStyle(feedback.isCorrect ? Color.green : Color.red)
+
+            if let evaluation = feedback.essayEvaluation {
+                Text("总分：\(evaluation.score) / \(evaluation.maximumScore)")
+                    .font(.title3.weight(.semibold))
+                ForEach(Array(evaluation.criteria.enumerated()), id: \.offset) { _, criterion in
+                    HStack(alignment: .top, spacing: 8) {
+                        Image(systemName: criterion.passed ? "checkmark.circle.fill" : "xmark.circle.fill")
+                            .foregroundStyle(criterion.passed ? Color.green : Color.orange)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("\(criterion.title)：\(criterion.awardedScore) / \(criterion.maximumScore)")
+                                .font(.callout.weight(.semibold))
+                            Text(criterion.comment)
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+                Text(evaluation.summary)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            }
 
             if feedback.removedFromWrongBook {
                 Label("已达到连续正确次数，自动移出错题本。", systemImage: "checkmark.seal.fill")
@@ -473,14 +589,21 @@ private struct FeedbackView: View {
                 Divider()
                 Text("解析")
                     .font(.headline)
-                Text(ExplanationOptionLabelMapper.displayText(explanation, options: question.options))
-                    .textSelection(.enabled)
-                    .fixedSize(horizontal: false, vertical: true)
+                QuestionRichContentView(
+                    content: ExplanationOptionLabelMapper.displayText(explanation, options: question.options)
+                )
             }
         }
         .padding(18)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 12))
+    }
+
+    private var feedbackTitle: String {
+        if let evaluation = feedback.essayEvaluation {
+            return evaluation.passed ? "论述题评分通过" : "论述题评分未通过"
+        }
+        return feedback.isCorrect ? "回答正确" : "回答错误"
     }
 }
 
@@ -513,7 +636,7 @@ private struct EmptyPracticeView: View {
                 .foregroundStyle(.secondary)
             Text("无法读取当前题目")
                 .font(.title3.weight(.semibold))
-            Text("请返回主页刷新题库。")
+            Text("请返回主页刷新题本。")
                 .foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

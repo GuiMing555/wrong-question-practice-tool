@@ -1,17 +1,30 @@
-import CryptoKit
 import Foundation
 import QuestionBankCore
 
 struct CapturedQuestionRecord {
+    let subject: StudySubject
     let sourcePath: String
     let sourceHash: String
     let capturedAt: Date
     let question: String
     let options: [String]
     let correctAnswer: String
+    let questionType: String?
     let explanation: String
     let knowledgePoints: [String]
     let needsReview: Bool
+    let curriculumSection: String?
+    let curriculumChapter: String?
+    let contentAnalysisJSON: String?
+    let contentInputHash: String?
+    let contentCompletedAt: Date?
+    let repeatOccurrences: [CapturedQuestionOccurrence]
+}
+
+struct CapturedQuestionOccurrence {
+    let sourcePath: String
+    let sourceHash: String
+    let capturedAt: Date
 }
 
 struct QuestionBankSyncReport {
@@ -19,6 +32,9 @@ struct QuestionBankSyncReport {
     var updatedCount = 0
     var unchangedCount = 0
     var skippedReviewCount = 0
+    var repeatedWrongCount = 0
+    var apiResponseCount = 0
+    var synchronizedBySubject: [StudySubject: Int] = [:]
     var failures: [String] = []
 
     var synchronizedCount: Int { insertedCount + updatedCount + unchangedCount }
@@ -26,9 +42,18 @@ struct QuestionBankSyncReport {
     var hasFailures: Bool { !failures.isEmpty }
 
     var summary: String {
-        var value = "练习题库：已同步 \(synchronizedCount) 个截图记录"
+        let subjectSummary = StudySubject.allCases.map {
+            "\($0.displayName) \(synchronizedBySubject[$0, default: 0]) 题"
+        }.joined(separator: "，")
+        var value = "练习题本：已同步 \(synchronizedCount) 个截图记录（\(subjectSummary)）"
         if skippedReviewCount > 0 {
-            value += "，\(skippedReviewCount) 张待校对图片未进入可刷题库"
+            value += "，\(skippedReviewCount) 张待校对图片未进入题本"
+        }
+        if repeatedWrongCount > 0 {
+            value += "，重复遇题错误次数 +\(repeatedWrongCount)"
+        }
+        if apiResponseCount > 0 {
+            value += "，题目分析回复入库 \(apiResponseCount) 条"
         }
         if !failures.isEmpty {
             value += "，\(failures.count) 项同步失败（不影响 JSON 和 Word 文档）"
@@ -43,41 +68,76 @@ struct QuestionBankSyncReport {
 }
 
 final class QuestionBankSync {
-    private let databaseURLProvider: () throws -> URL
+    private let databaseURLProvider: (StudySubject) throws -> URL
 
-    init(databaseURLProvider: @escaping () throws -> URL = { try QuestionBankPaths.defaultDatabaseURL() }) {
+    init(databaseURLProvider: @escaping (StudySubject) throws -> URL = {
+        try QuestionBankPaths.defaultDatabaseURL(for: $0)
+    }) {
         self.databaseURLProvider = databaseURLProvider
     }
 
-    func synchronize(_ records: [CapturedQuestionRecord]) -> QuestionBankSyncReport {
+    func synchronize(
+        _ records: [CapturedQuestionRecord],
+        contentServiceConfiguration: SharedContentServiceConfiguration? = nil
+    ) -> QuestionBankSyncReport {
         var report = QuestionBankSyncReport()
         report.skippedReviewCount = records.filter(\.needsReview).count
         let eligible = records.filter { !$0.needsReview }
         guard !eligible.isEmpty else { return report }
 
-        let store: QuestionBankStore
-        let databaseURL: URL
-        do {
-            databaseURL = try databaseURLProvider()
-            store = try QuestionBankStore(databaseURL: databaseURL, sourceApplication: "capture")
-            try store.migrate()
-        } catch {
-            report.failures.append("无法打开共享题库：\(error.localizedDescription)")
-            return report
-        }
-
-        for record in eligible {
+        for subject in StudySubject.allCases {
+            let subjectRecords = eligible.filter { $0.subject == subject }
+            guard !subjectRecords.isEmpty else { continue }
             do {
-                let draft = try makeDraft(from: record)
-                // 截图同步只导入题目；错题状态只由实际答错或用户明确标记产生。
-                let result = try store.importCapturedQuestion(draft)
-                switch result.status {
-                case .inserted: report.insertedCount += 1
-                case .updated: report.updatedCount += 1
-                case .unchanged: report.unchangedCount += 1
+                let databaseURL = try databaseURLProvider(subject)
+                let store = try QuestionBankStore(
+                    databaseURL: databaseURL,
+                    sourceApplication: "capture:\(subject.rawValue)"
+                )
+                try store.migrate()
+                for record in subjectRecords {
+                    do {
+                        let draft = try makeDraft(from: record)
+                        // 截图同步只导入题目；错题状态只由实际答错或用户明确标记产生。
+                        let result = try store.importCapturedQuestion(draft)
+                        switch result.status {
+                        case .inserted: report.insertedCount += 1
+                        case .updated: report.updatedCount += 1
+                        case .unchanged: report.unchangedCount += 1
+                        }
+                        if let json = record.contentAnalysisJSON,
+                           let data = json.data(using: .utf8),
+                           let contentResult = try? JSONDecoder().decode(QuestionContentResult.self, from: data) {
+                            let inputHash = record.contentInputHash ?? "capture:\(record.sourceHash)"
+                            let inserted = try store.recordAPIResponse(
+                                questionID: result.questionID,
+                                inputHash: inputHash,
+                                endpoint: contentServiceConfiguration?.endpoint ?? "capture-import",
+                                model: contentServiceConfiguration?.model ?? "",
+                                result: contentResult,
+                                receivedAt: record.contentCompletedAt ?? record.capturedAt
+                            )
+                            if inserted { report.apiResponseCount += 1 }
+                        }
+                        for occurrence in record.repeatOccurrences {
+                            if try store.recordCapturedQuestionRepeat(
+                                questionID: result.questionID,
+                                sourceImagePath: occurrence.sourcePath,
+                                sourceImageHash: occurrence.sourceHash,
+                                capturedAt: occurrence.capturedAt
+                            ) {
+                                report.repeatedWrongCount += 1
+                            }
+                        }
+                        report.synchronizedBySubject[subject, default: 0] += 1
+                    } catch {
+                        report.failures.append(
+                            "\(subject.displayName) / \(URL(fileURLWithPath: record.sourcePath).lastPathComponent)：\(error.localizedDescription)"
+                        )
+                    }
                 }
             } catch {
-                report.failures.append("\(URL(fileURLWithPath: record.sourcePath).lastPathComponent)：\(error.localizedDescription)")
+                report.failures.append("无法打开\(subject.displayName)题本：\(error.localizedDescription)")
             }
         }
 
@@ -85,6 +145,24 @@ final class QuestionBankSync {
     }
 
     private func makeDraft(from record: CapturedQuestionRecord) throws -> CapturedQuestionDraft {
+        if record.questionType == "论述题" || (record.subject == .politics && record.options.isEmpty) {
+            return CapturedQuestionDraft(
+                stableExternalID: CapturedQuestionIdentity.stableExternalID(for: record.question),
+                stem: record.question,
+                options: [],
+                correctLabels: [],
+                type: .essay,
+                explanation: record.explanation,
+                knowledgePoints: record.knowledgePoints,
+                sourceImagePath: record.sourcePath,
+                sourceImageHash: record.sourceHash,
+                capturedAt: record.capturedAt,
+                source: "capture",
+                curriculumSection: record.curriculumSection,
+                curriculumChapter: record.curriculumChapter,
+                contentAnalysisJSON: record.contentAnalysisJSON
+            )
+        }
         let parsedOptions = record.options.enumerated().map { index, raw in
             let fallback = String(UnicodeScalar(65 + index)!)
             let parsed = splitOption(raw, fallbackLabel: fallback)
@@ -101,7 +179,7 @@ final class QuestionBankSync {
         }
 
         return CapturedQuestionDraft(
-            stableExternalID: stableExternalID(for: record.question),
+            stableExternalID: CapturedQuestionIdentity.stableExternalID(for: record.question),
             stem: record.question,
             options: parsedOptions,
             correctLabels: correctLabels,
@@ -110,7 +188,10 @@ final class QuestionBankSync {
             sourceImagePath: record.sourcePath,
             sourceImageHash: record.sourceHash,
             capturedAt: record.capturedAt,
-            source: "capture"
+            source: "capture",
+            curriculumSection: record.curriculumSection,
+            curriculumChapter: record.curriculumChapter,
+            contentAnalysisJSON: record.contentAnalysisJSON
         )
     }
 
@@ -129,13 +210,4 @@ final class QuestionBankSync {
         )
     }
 
-    private func stableExternalID(for question: String) -> String {
-        let scalars = question.lowercased().unicodeScalars.filter { scalar in
-            CharacterSet.alphanumerics.contains(scalar) ||
-                (0x4E00...0x9FFF).contains(Int(scalar.value))
-        }
-        let normalized = String(String.UnicodeScalarView(scalars))
-        let digest = SHA256.hash(data: Data(normalized.utf8))
-        return "capture:" + digest.map { String(format: "%02x", $0) }.joined()
-    }
 }

@@ -2,11 +2,35 @@ import AppKit
 import CryptoKit
 import Foundation
 import ImageIO
-import NaturalLanguage
 import QuestionBankCore
 import Vision
 
+struct OrganizerProgressUpdate: Sendable {
+    let phase: String
+    let completed: Int
+    let total: Int
+    let detail: String
+}
+
+enum OrganizerRunMode: Equatable {
+    case normal
+    case repairPendingExplanationsOnce
+}
+
+struct OrganizerContentFailure: Sendable {
+    let questionID: String
+    let question: String
+    let attemptCount: Int
+    let reasons: [String]
+
+    var copyText: String {
+        let reasonText = reasons.enumerated().map { "第 \($0.offset + 1) 次：\($0.element)" }.joined(separator: "\n")
+        return "题目编号：\(questionID)\n题干：\(question)\n连续失败：\(attemptCount) 次\n\(reasonText)"
+    }
+}
+
 struct OrganizerReport {
+    let scannedImageCount: Int
     let newCount: Int
     let updatedCount: Int
     let totalCount: Int
@@ -15,31 +39,76 @@ struct OrganizerReport {
     let repeatedQuestionCount: Int
     let ignoredConsecutiveCount: Int
     let reviewCount: Int
-    let repeatedKnowledgeCount: Int
+    let automaticallyClassifiedCount: Int
+    let unclassifiedCount: Int
+    let classificationRetryCount: Int
+    let contentSubmittedCount: Int
+    let contentReusedCount: Int
+    let contentRetriedCount: Int
+    let contentCompletedCount: Int
+    let repairedExplanationCount: Int
+    let contentFailedCount: Int
+    let contentFailures: [OrganizerContentFailure]
+    let knowledgeCardCount: Int
     let questionBankSync: QuestionBankSyncReport
-    let questionBook: URL
-    let answerBook: URL
-    let knowledgeBook: URL
+    let workbookCount: Int
+    let workbook: URL?
+    let questionBook: URL?
+    let answerBook: URL?
+    let knowledgeBook: URL?
+    let screenshotArchive: URL?
+    let archivedImageCount: Int
 
     var summary: String {
-        "新增 \(newCount) 张，更新 \(updatedCount) 张，共 \(totalCount) 张截图；" +
+        "本轮读取 \(scannedImageCount) 份采集内容：新增 \(newCount) 份，更新 \(updatedCount) 份；历史记录共 \(totalCount) 份；" +
         "查重后 \(uniqueCount) 题，合并 \(duplicateCount) 个重复记录，" +
         "\(repeatedQuestionCount) 组题目非连续重复出现，" +
         "忽略 \(ignoredConsecutiveCount) 个连续误操作；" +
-        "\(reviewCount) 题需人工校对；\(repeatedKnowledgeCount) 个知识点重复出现。\n" +
-        "已生成纯题、答案与解析、薄弱知识点三份文档。\n" +
+        "\(reviewCount) 题需人工校对。\n" +
+        "科目自动分类：本轮确定 \(automaticallyClassifiedCount) 题，接口重试 \(classificationRetryCount) 次，" +
+        "仍有 \(unclassifiedCount) 题待分类。\n" +
+        "题目分析 API：复用题库已有回复 \(contentReusedCount) 题，本轮请求 \(contentSubmittedCount) 次，完成 \(contentCompletedCount) 题，" +
+        "自动重试 \(contentRetriedCount) 次，" +
+        "最终失败 \(contentFailedCount) 题；" +
+        "当前可背知识卡 \(knowledgeCardCount) 条。\n" +
+        (repairedExplanationCount > 0
+            ? "一次性解析补全：已按题干与答案重新生成并写回 \(repairedExplanationCount) 题。\n"
+            : "") +
+        (workbookCount == 0
+            ? "三个科目的题本工作簿均刷新失败。\n"
+            : "已刷新 \(workbookCount)/\(StudySubject.allCases.count) 个独立题本工作簿，错题本状态和累计答错次数来自实时作答记录。\n") +
+        "已生成当日新增知识点 Word，并按科目与章节去重。\n" +
+        (questionBook == nil ? "纯题和答案解析 Word 未开启。\n" : "已按题本表格生成纯题和答案解析 Word。\n") +
         questionBankSync.summary + "\n" +
-        "文件夹：\(questionBook.deletingLastPathComponent().path)"
+        (screenshotArchive.map { "已将 \(archivedImageCount) 份本轮原始采集内容校验后封存到：\($0.path)\n" }
+            ?? "本轮没有需要封存的原始采集内容。\n") +
+        "文件夹：\((workbook ?? questionBook)?.deletingLastPathComponent().path ?? "未生成")"
+    }
+
+    var copyableFailureText: String {
+        contentFailures.map(\.copyText).joined(separator: "\n\n--------------------\n\n")
     }
 }
 
 private struct OrganizerState: Codable {
-    var schemaVersion = 8
+    var schemaVersion = 11
     var lastRunAt: Date?
     var items: [WrongQuestionItem] = []
 }
 
+private struct ContentSubmissionRecord: Codable {
+    var requestID: String
+    var inputHash: String
+    var submittedAt: Date
+    var status: String
+    var completedAt: Date?
+    var failure: String?
+    var attemptCount: Int?
+    var failureHistory: [String]?
+}
+
 private struct WrongQuestionItem: Codable {
+    var subject: StudySubject?
     var id: String
     var sourcePath: String
     var sourceHash: String
@@ -53,6 +122,10 @@ private struct WrongQuestionItem: Codable {
     var explanation: String
     var knowledgePoints: [String]
     var needsReview: Bool
+    var curriculumSection: String?
+    var curriculumChapter: String?
+    var contentSubmission: ContentSubmissionRecord?
+    var contentResult: QuestionContentResult?
 }
 
 private struct ParsedQuestion {
@@ -61,8 +134,35 @@ private struct ParsedQuestion {
     var correctAnswer: String
     var userAnswer: String
     var explanation: String
-    var knowledgePoints: [String]
     var needsReview: Bool
+}
+
+private struct ContentProcessingReport {
+    var submittedCount = 0
+    var retriedCount = 0
+    var completedCount = 0
+    var failedCount = 0
+    var classifiedSubjectCount = 0
+    var repairedExplanationCount = 0
+    var failures: [OrganizerContentFailure] = []
+}
+
+private struct ExistingContentReuseReport {
+    var reusedCount = 0
+}
+
+private struct SubjectClassificationReport {
+    var classifiedCount = 0
+    var retriedCount = 0
+    var unclassifiedCount = 0
+}
+
+private struct ContentCandidate {
+    let itemIndex: Int
+    let input: QuestionContentInput
+    let missingAnswer: Bool
+    let missingExplanation: Bool
+    let isExplanationRepair: Bool
 }
 
 private struct DeduplicationResult {
@@ -104,7 +204,11 @@ final class WrongQuestionOrganizer {
         return folder
     }
 
-    func run(settings: AppSettings = .load()) throws -> OrganizerReport {
+    func run(
+        settings: AppSettings = .load(),
+        mode: OrganizerRunMode = .normal,
+        progress: ((OrganizerProgressUpdate) -> Void)? = nil
+    ) throws -> OrganizerReport {
         try settings.ensureFoldersExist()
         let root = try Self.captureRoot(settings: settings)
         let output = try Self.outputFolder(settings: settings)
@@ -119,15 +223,40 @@ final class WrongQuestionOrganizer {
                 state.items[index].correctAnswer = parsed.correctAnswer
                 state.items[index].userAnswer = parsed.userAnswer
                 state.items[index].explanation = parsed.explanation
-                state.items[index].knowledgePoints = parsed.knowledgePoints
+                state.items[index].knowledgePoints = []
                 state.items[index].needsReview = parsed.needsReview
                 state.items[index].recognizedAt = Date()
                 updatedCount += 1
             }
             state.schemaVersion = 8
         }
-        if settings.recognitionMode == .fentiQuestionBank {
+        if state.schemaVersion < 9 {
+            // 旧版基于分词频次生成的知识点不再使用，统一等待题目分析接口返回结构化结果。
             for index in state.items.indices {
+                state.items[index].knowledgePoints = []
+                state.items[index].contentSubmission = nil
+                state.items[index].contentResult = nil
+            }
+            state.schemaVersion = 9
+        }
+        if state.schemaVersion < 10 {
+            // 迁移前的历史截图全部来自医学综合题本；迁移后的新截图自动判断科目。
+            for index in state.items.indices where state.items[index].subject == nil {
+                state.items[index].subject = .medicalComprehensive
+            }
+            state.schemaVersion = 10
+        }
+        if state.schemaVersion < 11 {
+            for index in state.items.indices {
+                if let result = state.items[index].contentResult {
+                    state.items[index].curriculumSection = result.curriculumSection
+                    state.items[index].curriculumChapter = result.curriculumChapter
+                }
+            }
+            state.schemaVersion = 11
+        }
+        if settings.recognitionMode == .fentiQuestionBank {
+            for index in state.items.indices where state.items[index].subject == .medicalComprehensive {
                 let normalizedQuestion = normalizedFentiMedicalText(state.items[index].question)
                 let normalizedOptions = state.items[index].options.map(normalizedFentiMedicalText)
                 let normalizedExplanation = normalizedFentiMedicalText(state.items[index].explanation)
@@ -138,18 +267,14 @@ final class WrongQuestionOrganizer {
                 state.items[index].question = normalizedQuestion
                 state.items[index].options = normalizedOptions
                 state.items[index].explanation = normalizedExplanation
-                if !normalizedExplanation.hasPrefix("待人工补充") {
-                    state.items[index].knowledgePoints = extractKnowledgePoints(
-                        from: normalizedExplanation,
-                        question: normalizedQuestion
-                    )
-                }
                 state.items[index].recognizedAt = Date()
                 updatedCount += 1
             }
         }
         let images = try discoverImages(under: root, excluding: output)
+        progress?(OrganizerProgressUpdate(phase: "本机 OCR", completed: 0, total: images.count, detail: "正在检查截图…"))
         var itemsByPath = Dictionary(uniqueKeysWithValues: state.items.map { ($0.sourcePath, $0) })
+        var recognizedItemIDs: Set<String> = []
         var nextNumber = (state.items.compactMap { Int($0.id.dropFirst(2)) }.max() ?? 0) + 1
         var newCount = 0
 
@@ -157,13 +282,19 @@ final class WrongQuestionOrganizer {
             let path = imageURL.path
             let hash = try sha256(of: imageURL)
             if let existing = itemsByPath[path], existing.sourceHash == hash {
+                progress?(OrganizerProgressUpdate(
+                    phase: "本机 OCR", completed: index + 1, total: images.count,
+                    detail: "已检查 \(index + 1) / \(images.count) 份采集内容"
+                ))
                 continue
             }
 
             let rawText = try recognizeText(in: imageURL, recognitionMode: settings.recognitionMode)
             let parsed = parse(rawText: rawText, recognitionMode: settings.recognitionMode)
             let old = itemsByPath[path]
+            let explicitSubject = old?.subject ?? studySubject(for: imageURL)
             let item = WrongQuestionItem(
+                subject: explicitSubject,
                 id: old?.id ?? String(format: "WQ%04d", nextNumber),
                 sourcePath: path,
                 sourceHash: hash,
@@ -175,10 +306,15 @@ final class WrongQuestionOrganizer {
                 correctAnswer: parsed.correctAnswer,
                 userAnswer: parsed.userAnswer,
                 explanation: parsed.explanation,
-                knowledgePoints: parsed.knowledgePoints,
-                needsReview: parsed.needsReview
+                knowledgePoints: [],
+                needsReview: parsed.needsReview || explicitSubject == nil,
+                curriculumSection: nil,
+                curriculumChapter: nil,
+                contentSubmission: nil,
+                contentResult: nil
             )
             itemsByPath[path] = item
+            recognizedItemIDs.insert(item.id)
             if old == nil {
                 newCount += 1
                 nextNumber += 1
@@ -191,6 +327,10 @@ final class WrongQuestionOrganizer {
                 print("OCR 进度：\(completed)/\(images.count)")
                 fflush(stdout)
             }
+            progress?(OrganizerProgressUpdate(
+                phase: "本机 OCR", completed: completed, total: images.count,
+                detail: "已识别 \(completed) / \(images.count) 份采集内容"
+            ))
         }
 
         state.items = itemsByPath.values.sorted {
@@ -199,22 +339,39 @@ final class WrongQuestionOrganizer {
         }
         state.lastRunAt = Date()
 
-        let deduplicated = deduplicatedItems(state.items)
-        let knowledgeCounts = knowledgeOccurrenceCounts(in: deduplicated.episodeItems)
-        let questionBook = output.appendingPathComponent("医学综合错题本_纯题.docx")
-        let answerBook = output.appendingPathComponent("医学综合错题本_答案与解析.docx")
-        let knowledgeBook = output.appendingPathComponent("医学综合错题本_薄弱知识点.docx")
-        try createQuestionBook(
-            items: deduplicated.items,
-            occurrenceCountsByID: deduplicated.occurrenceCountsByID,
-            at: questionBook
+        let subjectClassification = try classifySubjects(
+            state: &state,
+            settings: settings,
+            stateURL: stateURL
         )
-        try createAnswerBook(
-            items: deduplicated.items,
-            occurrenceCountsByID: deduplicated.occurrenceCountsByID,
-            at: answerBook
+
+        var deduplicated = deduplicatedItems(state.items)
+        let repairKeys: Set<String> = mode == .repairPendingExplanationsOnce
+            ? Set(state.items.filter { recognizedItemIDs.contains($0.id) }.map(duplicateKey))
+            : []
+        let forcedExplanationItemIDs: Set<String> = Set(
+            deduplicated.items.compactMap { repairKeys.contains(duplicateKey(for: $0)) ? $0.id : nil }
         )
-        try createKnowledgeBook(items: deduplicated.episodeItems, knowledgeCounts: knowledgeCounts, at: knowledgeBook)
+        let reusedContent = try reuseStoredContentResults(
+            state: &state,
+            primaryItemIDs: Set(deduplicated.items.map(\.id)),
+            excludingItemIDs: forcedExplanationItemIDs,
+            stateURL: stateURL
+        )
+        let contentReport = try processContentService(
+            state: &state,
+            primaryItemIDs: Set(deduplicated.items.map(\.id)),
+            forcedExplanationItemIDs: forcedExplanationItemIDs,
+            repairOnly: mode == .repairPendingExplanationsOnce,
+            settings: settings,
+            stateURL: stateURL,
+            progress: progress
+        )
+        deduplicated = deduplicatedItems(state.items)
+        let legacyKnowledgeBook = output.appendingPathComponent("医学综合错题本_薄弱知识点.docx")
+        if fileManager.fileExists(atPath: legacyKnowledgeBook.path) {
+            try fileManager.removeItem(at: legacyKnowledgeBook)
+        }
         try syncProblemImages(
             reviewItems: state.items.filter(\.needsReview),
             consecutiveDuplicateItems: deduplicated.consecutiveDuplicateItems,
@@ -222,30 +379,139 @@ final class WrongQuestionOrganizer {
         )
         try stateEncoder.encode(state).write(to: stateURL, options: .atomic)
 
-        // 题库同步是附加产物：JSON、Word 和问题图片已经落盘后才执行。
-        // 即使数据库暂时不可写，也不得破坏原有整理结果。
-        // 连续误截图和非连续重复记录只保留在整理历史中；可刷题库按题干只同步一份，
-        // 避免相同题目的多个截图轮流覆盖同一数据库记录。
-        let syncRecords = deduplicated.items.map {
-            CapturedQuestionRecord(
-                sourcePath: $0.sourcePath,
-                sourceHash: $0.sourceHash,
-                capturedAt: $0.capturedAt,
-                question: $0.question,
-                options: $0.options,
-                correctAnswer: $0.correctAnswer,
-                explanation: $0.explanation,
-                knowledgePoints: $0.knowledgePoints,
-                needsReview: $0.needsReview
+        // 题本内容仍按题干只同步一份。非连续重复截图作为独立遇错事件写入计数，
+        // 连续截图视为误操作，不增加错误次数。
+        let syncRecords = deduplicated.items.compactMap { item -> CapturedQuestionRecord? in
+            guard let subject = item.subject else { return nil }
+            let key = duplicateKey(for: item)
+            let repeats = deduplicated.episodeItems.filter {
+                $0.id != item.id && duplicateKey(for: $0) == key
+            }.map {
+                CapturedQuestionOccurrence(
+                    sourcePath: $0.sourcePath,
+                    sourceHash: $0.sourceHash,
+                    capturedAt: $0.capturedAt
+                )
+            }
+            return CapturedQuestionRecord(
+                subject: subject,
+                sourcePath: item.sourcePath,
+                sourceHash: item.sourceHash,
+                capturedAt: item.capturedAt,
+                question: item.question,
+                options: item.options,
+                correctAnswer: item.correctAnswer,
+                questionType: item.contentResult?.questionType ?? (isEssayItem(item) ? "论述题" : nil),
+                explanation: item.explanation,
+                knowledgePoints: item.knowledgePoints,
+                needsReview: item.needsReview,
+                curriculumSection: item.curriculumSection ?? item.contentResult?.curriculumSection,
+                curriculumChapter: item.curriculumChapter ?? item.contentResult?.curriculumChapter,
+                contentAnalysisJSON: encodedContentResult(item.contentResult),
+                contentInputHash: item.contentSubmission?.inputHash,
+                contentCompletedAt: item.contentSubmission?.completedAt,
+                repeatOccurrences: repeats
             )
         }
-        let questionBankSync = QuestionBankSync().synchronize(syncRecords)
+        let sharedContentConfiguration = SharedContentServiceConfiguration(
+            enabled: settings.contentServiceEnabled,
+            endpoint: settings.contentServiceEndpoint,
+            model: settings.contentServiceModel,
+            accessKey: settings.contentServiceAccessKey,
+            knowledgeDocumentFolderPath: settings.outputFolderPath
+        )
+        let questionBankSync = QuestionBankSync().synchronize(
+            syncRecords,
+            contentServiceConfiguration: sharedContentConfiguration
+        )
         if questionBankSync.hasFailures {
             FileHandle.standardError.write(Data((questionBankSync.diagnostic + "\n").utf8))
         }
 
-        let repeated = knowledgeCounts.values.filter { $0 >= 2 }.count
+        var workbook: URL?
+        var workbookCount = 0
+        var workbookRowsBySubject: [StudySubject: [QuestionWorkbookRow]] = [:]
+        for subject in StudySubject.allCases {
+            let workbookURL = output.appendingPathComponent(subject.workbookFilename)
+            do {
+                let store = try QuestionBankStore(
+                    databaseURL: QuestionBankPaths.defaultDatabaseURL(for: subject),
+                    sourceApplication: "capture-workbook:\(subject.rawValue)"
+                )
+                try store.configureWorkbookOutput(workbookURL)
+                let generated = try store.exportWorkbook(to: workbookURL)
+                workbookCount += 1
+                workbookRowsBySubject[subject] = try store.workbookRows()
+                if subject == .medicalComprehensive { workbook = generated }
+            } catch {
+                FileHandle.standardError.write(
+                    Data(("\(subject.displayName)题本工作簿刷新失败：\(error.localizedDescription)\n").utf8)
+                )
+            }
+        }
+
+        let completedItems = deduplicated.items.filter { $0.contentResult != nil }
+        let today = Date()
+        let startOfToday = Calendar.current.startOfDay(for: today)
+        let startOfTomorrow = Calendar.current.date(byAdding: .day, value: 1, to: startOfToday) ?? today
+        var dailyKnowledgeRecords: [QuestionKnowledgeRecord] = []
+        for subject in StudySubject.allCases {
+            let store = try QuestionBankStore(
+                databaseURL: QuestionBankPaths.defaultDatabaseURL(for: subject),
+                sourceApplication: "capture-daily-knowledge:\(subject.rawValue)"
+            )
+            dailyKnowledgeRecords += try store.knowledgeRecords(
+                subject: subject,
+                wrongBookOnly: false,
+                receivedFrom: startOfToday,
+                receivedBefore: startOfTomorrow
+            )
+        }
+        let knowledgeBookURL = output.appendingPathComponent("\(shortDate(today))新增知识点.docx")
+        try KnowledgeDocumentWriter.write(
+            records: dailyKnowledgeRecords,
+            kind: .dailyNew(date: today),
+            to: knowledgeBookURL
+        )
+        var questionBook: URL?
+        var answerBook: URL?
+        let knowledgeBook: URL? = knowledgeBookURL
+        if settings.generateWordDocuments {
+            for subject in StudySubject.allCases {
+                let questionBookURL = output.appendingPathComponent(subject.questionDocumentFilename)
+                let answerBookURL = output.appendingPathComponent(subject.answerDocumentFilename)
+                let rows = workbookRowsBySubject[subject, default: []]
+                try createQuestionBook(rows: rows, subject: subject, at: questionBookURL)
+                try createAnswerBook(rows: rows, subject: subject, at: answerBookURL)
+                if subject == .medicalComprehensive {
+                    questionBook = questionBookURL
+                    answerBook = answerBookURL
+                }
+            }
+        }
+
+        let knowledgeCardCount = completedItems.reduce(0) { $0 + ($1.contentResult?.knowledgeCards.count ?? 0) }
+        progress?(OrganizerProgressUpdate(
+            phase: "封存原始采集内容",
+            completed: 0,
+            total: images.isEmpty ? 0 : 1,
+            detail: images.isEmpty ? "没有待封存的原始采集内容" : "正在创建并校验本轮采集内容压缩包…"
+        ))
+        let screenshotArchive = try ScreenshotBatchArchiver().archive(
+            imageURLs: images,
+            captureRoot: root
+        )
+        if screenshotArchive != nil {
+            progress?(OrganizerProgressUpdate(
+                phase: "封存原始采集内容",
+                completed: 1,
+                total: 1,
+                detail: "已封存 \(screenshotArchive?.archivedImageCount ?? 0) 份原始采集内容"
+            ))
+        }
+
         return OrganizerReport(
+            scannedImageCount: images.count,
             newCount: newCount,
             updatedCount: updatedCount,
             totalCount: state.items.count,
@@ -254,11 +520,28 @@ final class WrongQuestionOrganizer {
             repeatedQuestionCount: deduplicated.repeatedQuestionCount,
             ignoredConsecutiveCount: deduplicated.ignoredConsecutiveCount,
             reviewCount: state.items.filter(\.needsReview).count,
-            repeatedKnowledgeCount: repeated,
+            automaticallyClassifiedCount: subjectClassification.classifiedCount + contentReport.classifiedSubjectCount,
+            unclassifiedCount: state.items.filter {
+                $0.subject == nil ||
+                    (settings.contentServiceEnabled && $0.contentSubmission?.status == "failed" && $0.contentResult == nil)
+            }.count,
+            classificationRetryCount: contentReport.retriedCount,
+            contentSubmittedCount: contentReport.submittedCount,
+            contentReusedCount: reusedContent.reusedCount,
+            contentRetriedCount: contentReport.retriedCount,
+            contentCompletedCount: contentReport.completedCount,
+            repairedExplanationCount: contentReport.repairedExplanationCount,
+            contentFailedCount: contentReport.failedCount,
+            contentFailures: contentReport.failures,
+            knowledgeCardCount: knowledgeCardCount,
             questionBankSync: questionBankSync,
+            workbookCount: workbookCount,
+            workbook: workbook,
             questionBook: questionBook,
             answerBook: answerBook,
-            knowledgeBook: knowledgeBook
+            knowledgeBook: knowledgeBook,
+            screenshotArchive: screenshotArchive?.archiveURL,
+            archivedImageCount: screenshotArchive?.archivedImageCount ?? 0
         )
     }
 
@@ -266,6 +549,391 @@ final class WrongQuestionOrganizer {
         guard fileManager.fileExists(atPath: url.path) else { return OrganizerState() }
         let decoded = try stateDecoder.decode(OrganizerState.self, from: Data(contentsOf: url))
         return decoded
+    }
+
+    private func reuseStoredContentResults(
+        state: inout OrganizerState,
+        primaryItemIDs: Set<String>,
+        excludingItemIDs: Set<String> = [],
+        stateURL: URL
+    ) throws -> ExistingContentReuseReport {
+        var report = ExistingContentReuseReport()
+        var stores: [StudySubject: QuestionBankStore] = [:]
+        for index in state.items.indices {
+            let item = state.items[index]
+            guard primaryItemIDs.contains(item.id),
+                  !excludingItemIDs.contains(item.id),
+                  let subject = item.subject,
+                  let candidate = contentCandidate(for: item, at: index)
+            else { continue }
+            if item.contentSubmission?.status == "completed", item.contentResult != nil { continue }
+
+            if let existingResult = item.contentResult, !existingResult.knowledgeCards.isEmpty {
+                state.items[index].contentSubmission = ContentSubmissionRecord(
+                    requestID: "reused:state:\(item.id)",
+                    inputHash: QuestionContentService.inputHash(candidate.input),
+                    submittedAt: item.recognizedAt,
+                    status: "completed",
+                    completedAt: item.recognizedAt,
+                    failure: nil,
+                    attemptCount: 0,
+                    failureHistory: []
+                )
+                report.reusedCount += 1
+                continue
+            }
+            let store: QuestionBankStore
+            if let existing = stores[subject] {
+                store = existing
+            } else {
+                store = try QuestionBankStore(
+                    databaseURL: QuestionBankPaths.defaultDatabaseURL(for: subject),
+                    sourceApplication: "capture-analysis-reuse:\(subject.rawValue)"
+                )
+                stores[subject] = store
+            }
+            let externalID = CapturedQuestionIdentity.stableExternalID(for: item.question)
+            guard let stored = try store.storedAnalysis(externalID: externalID),
+                  stored.result.subject == subject
+            else { continue }
+
+            if candidate.missingExplanation,
+               let explanation = stored.result.resolvedExplanation,
+               !explanation.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                state.items[index].explanation = explanation
+            }
+            if candidate.missingAnswer,
+               !isEssayItem(state.items[index]),
+               let answer = normalizedResolvedAnswer(
+                   stored.result.resolvedAnswer,
+                   options: state.items[index].options
+               ) {
+                state.items[index].correctAnswer = answer
+            }
+            state.items[index].contentResult = stored.result
+            state.items[index].subject = stored.result.subject
+            state.items[index].curriculumSection = stored.result.curriculumSection
+            state.items[index].curriculumChapter = stored.result.curriculumChapter
+            state.items[index].knowledgePoints = stored.result.knowledgeCards.map(\.title)
+            let currentCandidate = contentCandidate(for: state.items[index], at: index) ?? candidate
+            state.items[index].contentSubmission = ContentSubmissionRecord(
+                requestID: "reused:\(stored.questionID)",
+                inputHash: QuestionContentService.inputHash(currentCandidate.input),
+                submittedAt: stored.receivedAt,
+                status: "completed",
+                completedAt: stored.receivedAt,
+                failure: nil,
+                attemptCount: 0,
+                failureHistory: []
+            )
+            report.reusedCount += 1
+        }
+        if report.reusedCount > 0 {
+            try stateEncoder.encode(state).write(to: stateURL, options: .atomic)
+        }
+        return report
+    }
+
+    private func classifySubjects(
+        state: inout OrganizerState,
+        settings: AppSettings,
+        stateURL: URL
+    ) throws -> SubjectClassificationReport {
+        var report = SubjectClassificationReport()
+
+        for index in state.items.indices where state.items[index].subject == nil {
+            let question = state.items[index].question
+            let options = state.items[index].options
+            let detected = QuestionSubjectClassifier.classifyLocally(
+                question: question,
+                options: options
+            )
+
+            if let detected {
+                state.items[index].subject = detected
+                let reparsed = parse(
+                    rawText: state.items[index].rawText,
+                    recognitionMode: settings.recognitionMode
+                )
+                state.items[index].needsReview = reparsed.needsReview
+                report.classifiedCount += 1
+            } else {
+                state.items[index].needsReview = true
+            }
+        }
+        report.unclassifiedCount = state.items.filter { $0.subject == nil }.count
+        try stateEncoder.encode(state).write(to: stateURL, options: .atomic)
+        return report
+    }
+
+    private func processContentService(
+        state: inout OrganizerState,
+        primaryItemIDs: Set<String>,
+        forcedExplanationItemIDs: Set<String> = [],
+        repairOnly: Bool = false,
+        settings: AppSettings,
+        stateURL: URL,
+        progress: ((OrganizerProgressUpdate) -> Void)?
+    ) throws -> ContentProcessingReport {
+        var report = ContentProcessingReport()
+        guard settings.contentServiceEnabled,
+              let endpoint = URL(string: settings.contentServiceEndpoint)
+        else { return report }
+
+        let service = QuestionContentService(
+            endpoint: endpoint,
+            accessKey: settings.contentServiceAccessKey,
+            model: settings.contentServiceModel
+        )
+        let maximumAttempts = 3
+        for index in state.items.indices {
+            let item = state.items[index]
+            if repairOnly, !forcedExplanationItemIDs.contains(item.id) { continue }
+            guard let candidate = contentCandidate(
+                for: item,
+                at: index,
+                forceCompleteExplanation: forcedExplanationItemIDs.contains(item.id)
+            ) else { continue }
+            let currentHash = QuestionContentService.inputHash(candidate.input)
+            guard primaryItemIDs.contains(item.id),
+                  let submission = item.contentSubmission,
+                  submission.inputHash == currentHash,
+                  submission.status == "failed",
+                  (submission.attemptCount ?? 0) >= maximumAttempts
+            else { continue }
+            let reasons = submission.failureHistory ?? submission.failure.map { [$0] } ?? ["未记录具体原因"]
+            report.failures.append(
+                OrganizerContentFailure(
+                    questionID: item.id,
+                    question: item.question,
+                    attemptCount: submission.attemptCount ?? maximumAttempts,
+                    reasons: reasons
+                )
+            )
+        }
+        report.failedCount = report.failures.count
+        let candidates = state.items.indices.compactMap { index -> ContentCandidate? in
+            let item = state.items[index]
+            if repairOnly, !forcedExplanationItemIDs.contains(item.id) { return nil }
+            guard primaryItemIDs.contains(item.id),
+                  !item.question.hasPrefix("[OCR"),
+                  (item.options.count >= 2 || isEssayItem(item)),
+                  let candidate = contentCandidate(
+                    for: item,
+                    at: index,
+                    forceCompleteExplanation: forcedExplanationItemIDs.contains(item.id)
+                  )
+            else { return nil }
+            let currentHash = QuestionContentService.inputHash(candidate.input)
+            guard let submission = item.contentSubmission else { return candidate }
+            if submission.inputHash != currentHash { return candidate }
+            if submission.status == "completed", item.contentResult != nil { return nil }
+            return submission.status == "failed" && (submission.attemptCount ?? 1) < maximumAttempts
+                ? candidate
+                : nil
+        }
+        let progressPhase = forcedExplanationItemIDs.isEmpty ? "题目分析 API" : "一次性解析补全 API"
+        progress?(OrganizerProgressUpdate(
+            phase: progressPhase, completed: 0, total: candidates.count,
+            detail: candidates.isEmpty ? "没有需要提交的新题" : "准备分析 \(candidates.count) 道题…"
+        ))
+
+        let concurrentRequestCount = 8
+        var pendingCandidates = candidates
+        var nextCandidatePosition = 0
+        var completedPosition = 0
+        while nextCandidatePosition < pendingCandidates.count {
+            let end = min(nextCandidatePosition + concurrentRequestCount, pendingCandidates.count)
+            let wave = Array(pendingCandidates[nextCandidatePosition..<end])
+            for candidate in wave {
+                let previousSubmission = state.items[candidate.itemIndex].contentSubmission
+                let inputHash = QuestionContentService.inputHash(candidate.input)
+                let isSameInput = previousSubmission?.inputHash == inputHash
+                let previousAttempts = isSameInput ? (previousSubmission?.attemptCount ?? 1) : 0
+                let previousFailures = isSameInput
+                    ? (previousSubmission?.failureHistory ?? previousSubmission?.failure.map { [$0] } ?? [])
+                    : []
+                if previousAttempts > 0 {
+                    report.retriedCount += 1
+                }
+                state.items[candidate.itemIndex].contentSubmission = ContentSubmissionRecord(
+                    requestID: UUID().uuidString,
+                    inputHash: inputHash,
+                    submittedAt: Date(),
+                    status: "submitted",
+                    completedAt: nil,
+                    failure: nil,
+                    attemptCount: previousAttempts + 1,
+                    failureHistory: previousFailures
+                )
+            }
+            // 每一并发批次在发出请求前落盘，确保重启后不会超过限定重试次数。
+            try stateEncoder.encode(state).write(to: stateURL, options: .atomic)
+            report.submittedCount += wave.count
+
+            let resultLock = NSLock()
+            var results: [Int: Result<QuestionContentResult, Error>] = [:]
+            DispatchQueue.concurrentPerform(iterations: wave.count) { offset in
+                let candidate = wave[offset]
+                let result: Result<QuestionContentResult, Error>
+                do {
+                    result = .success(try service.analyze(candidate.input))
+                } catch {
+                    result = .failure(error)
+                }
+                resultLock.lock()
+                results[candidate.itemIndex] = result
+                resultLock.unlock()
+            }
+
+            var retryCandidates: [ContentCandidate] = []
+            for candidate in wave {
+                let index = candidate.itemIndex
+                do {
+                    guard let outcome = results[index] else {
+                        throw QuestionContentServiceError.emptyResponse
+                    }
+                    let result = try outcome.get()
+                    if candidate.missingExplanation {
+                        guard let explanation = result.resolvedExplanation, !explanation.isEmpty else {
+                            throw QuestionContentServiceError.invalidResponse
+                        }
+                        state.items[index].explanation = explanation
+                    }
+                    if candidate.missingAnswer {
+                        guard let answer = normalizedResolvedAnswer(
+                            result.resolvedAnswer,
+                            options: state.items[index].options
+                        ) else { throw QuestionContentServiceError.invalidResponse }
+                        state.items[index].correctAnswer = answer
+                    }
+
+                    state.items[index].contentResult = result
+                    report.classifiedSubjectCount += 1
+                    state.items[index].subject = result.subject
+                    state.items[index].curriculumSection = result.curriculumSection
+                    state.items[index].curriculumChapter = result.curriculumChapter
+                    state.items[index].knowledgePoints = result.knowledgeCards.map(\.title)
+                    state.items[index].contentSubmission?.status = "completed"
+                    state.items[index].contentSubmission?.completedAt = Date()
+                    state.items[index].contentSubmission?.failure = nil
+                    if candidate.isExplanationRepair {
+                        report.repairedExplanationCount += 1
+                    }
+                    if let canonical = contentCandidate(for: state.items[index], at: index) {
+                        state.items[index].contentSubmission?.inputHash = QuestionContentService.inputHash(canonical.input)
+                    }
+
+                    let minimumOptions = result.questionType == "判断题" ? 2 : 4
+                    let isEssay = result.questionType == "论述题"
+                    let structuralIssue = state.items[index].question.hasPrefix("[OCR") ||
+                        (!isEssay && state.items[index].options.count < minimumOptions) ||
+                        state.items[index].options.contains(where: isSuspiciousFentiOption)
+                    if !structuralIssue,
+                       (isEssay || state.items[index].correctAnswer != "待校对"),
+                       !state.items[index].explanation.hasPrefix("待人工补充") {
+                        state.items[index].needsReview = false
+                    }
+                    report.completedCount += 1
+                } catch {
+                    state.items[index].contentSubmission?.status = "failed"
+                    state.items[index].contentSubmission?.completedAt = Date()
+                    state.items[index].contentSubmission?.failure = error.localizedDescription
+                    var failureHistory = state.items[index].contentSubmission?.failureHistory ?? []
+                    failureHistory.append(error.localizedDescription)
+                    state.items[index].contentSubmission?.failureHistory = failureHistory
+                    let attemptCount = state.items[index].contentSubmission?.attemptCount ?? maximumAttempts
+                    if attemptCount < maximumAttempts {
+                        retryCandidates.append(candidate)
+                        print("题目分析自动重试：\(state.items[index].id)（第 \(attemptCount + 1)/\(maximumAttempts) 次）")
+                        fflush(stdout)
+                        progress?(OrganizerProgressUpdate(
+                            phase: progressPhase, completed: completedPosition, total: candidates.count,
+                            detail: "\(state.items[index].id) 第 \(attemptCount) 次失败，正在进行第 \(attemptCount + 1) 次尝试…"
+                        ))
+                        continue
+                    }
+                    state.items[index].needsReview = true
+                    report.failedCount += 1
+                    let failures = state.items[index].contentSubmission?.failureHistory ?? [error.localizedDescription]
+                    report.failures.append(
+                        OrganizerContentFailure(
+                            questionID: state.items[index].id,
+                            question: state.items[index].question,
+                            attemptCount: attemptCount,
+                            reasons: failures
+                        )
+                    )
+                }
+                completedPosition += 1
+                print("题目分析进度：\(completedPosition)/\(candidates.count)")
+                fflush(stdout)
+                progress?(OrganizerProgressUpdate(
+                    phase: progressPhase, completed: completedPosition, total: candidates.count,
+                    detail: "已完成 \(completedPosition) / \(candidates.count) 道题"
+                ))
+            }
+            try stateEncoder.encode(state).write(to: stateURL, options: .atomic)
+            pendingCandidates.append(contentsOf: retryCandidates)
+            nextCandidatePosition = end
+        }
+        return report
+    }
+
+    private func contentCandidate(
+        for item: WrongQuestionItem,
+        at index: Int,
+        forceCompleteExplanation: Bool = false
+    ) -> ContentCandidate? {
+        let isEssay = isEssayItem(item)
+        guard !item.question.hasPrefix("[OCR"), item.options.count >= 2 || isEssay else { return nil }
+        let missingAnswer = !isEssay && item.correctAnswer == "待校对"
+        let missingExplanation = forceCompleteExplanation || item.explanation.hasPrefix("待人工补充")
+        return ContentCandidate(
+            itemIndex: index,
+            input: QuestionContentInput(
+                stableID: item.id,
+                question: item.question,
+                options: item.options,
+                knownAnswer: missingAnswer ? nil : item.correctAnswer,
+                existingExplanation: missingExplanation ? nil : item.explanation,
+                requiresSolution: missingAnswer || missingExplanation,
+                subjectHint: item.subject?.displayName,
+                forceCompleteExplanation: forceCompleteExplanation
+            ),
+            missingAnswer: missingAnswer,
+            missingExplanation: missingExplanation,
+            isExplanationRepair: forceCompleteExplanation
+        )
+    }
+
+    private func isEssayItem(_ item: WrongQuestionItem) -> Bool {
+        item.contentResult?.questionType == "论述题" ||
+            item.rawText.range(
+                of: #"[\[［【(（]\s*(论述题|问答题|简答题)\s*[\]］】)）]"#,
+                options: .regularExpression
+            ) != nil
+    }
+
+    private func encodedContentResult(_ result: QuestionContentResult?) -> String? {
+        guard let result else { return nil }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        guard let data = try? encoder.encode(result) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    private func normalizedResolvedAnswer(_ answer: String?, options: [String]) -> String? {
+        guard let answer else { return nil }
+        let labels = answer.uppercased().unicodeScalars.compactMap { scalar -> String? in
+            guard (65...70).contains(Int(scalar.value)) else { return nil }
+            return String(Character(scalar))
+        }
+        let unique = Array(Set(labels)).sorted()
+        guard !unique.isEmpty else { return nil }
+        let available = Set(options.compactMap { optionComponents(in: $0)?.label })
+        guard Set(unique).isSubset(of: available) else { return nil }
+        return unique.joined()
     }
 
     private func discoverImages(under root: URL, excluding output: URL) throws -> [URL] {
@@ -276,7 +944,7 @@ final class WrongQuestionOrganizer {
             options: [.skipsHiddenFiles, .skipsPackageDescendants]
         ) else { return [] }
 
-        let extensions = Set(["png", "jpg", "jpeg", "heic"])
+        let imageExtensions = Set(["png", "jpg", "jpeg", "heic"])
         let rootPath = root.standardizedFileURL.path
         let outputPath = output.standardizedFileURL.path
         let outputIsNested = outputPath != rootPath && outputPath.hasPrefix(rootPath + "/")
@@ -284,9 +952,19 @@ final class WrongQuestionOrganizer {
             guard let url = entry as? URL,
                   (!outputIsNested || !url.path.hasPrefix(outputPath + "/")),
                   !url.pathComponents.contains(where: { $0.hasPrefix("待人工校对图片") }),
-                  extensions.contains(url.pathExtension.lowercased()),
+                  !url.pathComponents.contains(ScreenshotBatchArchiver.archiveFolderName),
                   (try? url.resourceValues(forKeys: Set(keys)).isRegularFile) == true
             else { return nil }
+            let isImage = imageExtensions.contains(url.pathExtension.lowercased())
+            let isSnapshot = PageSnapshotSidecar.isStandaloneSnapshotURL(url)
+            guard isImage || isSnapshot else { return nil }
+            if isSnapshot {
+                let basePath = String(url.path.dropLast(PageSnapshotSidecar.standaloneSuffix.count))
+                if fileManager.fileExists(atPath: basePath) {
+                    // 图片旁边的文字副本由图片作为主记录处理，不重复导入。
+                    return nil
+                }
+            }
             return url
         }.sorted { $0.path < $1.path }
     }
@@ -297,6 +975,12 @@ final class WrongQuestionOrganizer {
     }
 
     private func recognizeText(in url: URL, recognitionMode: RecognitionMode) throws -> String {
+        if let pageSnapshot = PageSnapshotSidecar.readStandalone(from: url), pageSnapshot.count >= 20 {
+            return pageSnapshot
+        }
+        if let pageSnapshot = PageSnapshotSidecar.read(nextTo: url), pageSnapshot.count >= 20 {
+            return pageSnapshot
+        }
         guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil)
         else {
@@ -359,14 +1043,20 @@ final class WrongQuestionOrganizer {
             .filter {
                 !$0.isEmpty && (!isInterfaceNoise($0, recognitionMode: recognitionMode) || ExplanationBoundary.isExactMarker($0))
             }
+        if recognitionMode == .fentiQuestionBank,
+           let reordered = reorderedFentiPageSnapshotLines(lines), !reordered.isEmpty {
+            lines = reordered
+        }
 
-        let questionMarkerPattern = #"\d*\s*[\[［【(（]\s*(单选题|多选题|判断题)\s*[\]］】)）Jj]?"#
+        let questionMarkerPattern = #"\d*\s*[\[［【(（]\s*(单选题|多选题|判断题|论述题|问答题|简答题)\s*[\]］】)）Jj]?"#
         let hasQuestionMarker = lines.contains {
             $0.range(of: questionMarkerPattern, options: .regularExpression) != nil
         }
-        let questionIndex = lines.firstIndex { line in
-            line.range(of: questionMarkerPattern, options: .regularExpression) != nil ||
-            line.contains("单选题") || line.contains("多选题") || line.contains("判断题")
+        let questionIndex = lines.firstIndex {
+            $0.range(of: questionMarkerPattern, options: .regularExpression) != nil
+        } ?? lines.firstIndex { line in
+            line.contains("单选题") || line.contains("多选题") || line.contains("判断题") ||
+                line.contains("论述题") || line.contains("问答题") || line.contains("简答题")
         } ?? 0
         if questionIndex > 0 { lines = Array(lines[questionIndex...]) }
 
@@ -424,7 +1114,7 @@ final class WrongQuestionOrganizer {
 
         var question = questionLines.joined(separator: " ")
         question = question.replacingOccurrences(
-            of: #"^\s*\d+\s*[\[［【(（]\s*(单选题|多选题|判断题)\s*[\]］】)）1lI|｜Jj]?\s*"#,
+            of: #"^\s*\d*\s*[\[［【(（]\s*(单选题|多选题|判断题|论述题|问答题|简答题)\s*[\]］】)）1lI|｜Jj]?\s*"#,
             with: "",
             options: .regularExpression
         ).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -443,7 +1133,13 @@ final class WrongQuestionOrganizer {
             question = "[OCR 未能可靠识别题干，请对照原截图]"
         }
 
-        let correctAnswer = extractAnswer(label: "参考答案", lines: lines)
+        let isEssayQuestion = lines.contains {
+            $0.range(
+                of: #"[\[［【(（]\s*(论述题|问答题|简答题)\s*[\]］】)）]"#,
+                options: .regularExpression
+            ) != nil
+        }
+        let correctAnswer = isEssayQuestion ? "主观评分" : extractAnswer(label: "参考答案", lines: lines)
         let userAnswer = extractAnswer(label: "我的答案", lines: lines)
         var explanation = ""
         if let start = explanationIndex {
@@ -470,19 +1166,28 @@ final class WrongQuestionOrganizer {
         if recognitionMode == .fentiQuestionBank {
             explanation = normalizedFentiMedicalText(explanation)
         }
+        if isEssayQuestion {
+            let referenceAnswer = extractEssayReferenceAnswer(
+                lines: lines,
+                answerIndex: answerIndex,
+                explanationIndex: explanationIndex
+            )
+            if explanation.isEmpty {
+                explanation = referenceAnswer
+            } else if !referenceAnswer.isEmpty, !explanation.contains(referenceAnswer) {
+                explanation = "参考答案：\(referenceAnswer)\n参考解析：\(explanation)"
+            }
+        }
         if explanation.isEmpty { explanation = "待人工补充：截图中未可靠识别到参考解析。" }
 
-        let knowledgePoints = explanation.hasPrefix("待人工补充")
-            ? []
-            : extractKnowledgePoints(from: explanation, question: question)
         let isBinaryQuestion = questionArea.first?.contains("判断题") == true
-        let minimumOptions = isBinaryQuestion ? 2 : 4
+        let minimumOptions = isEssayQuestion ? 0 : (isBinaryQuestion ? 2 : 4)
         let suspiciousFentiStem = recognitionMode == .fentiQuestionBank &&
             isSuspiciousFentiStem(question, hasQuestionMarker: hasQuestionMarker)
         let suspiciousFentiOptions = recognitionMode == .fentiQuestionBank &&
             options.contains(where: isSuspiciousFentiOption)
         let needsReview = question.hasPrefix("[OCR") || options.count < minimumOptions ||
-            correctAnswer == "待校对" || explanation.hasPrefix("待人工补充") ||
+            (!isEssayQuestion && correctAnswer == "待校对") || explanation.hasPrefix("待人工补充") ||
             suspiciousFentiStem || suspiciousFentiOptions
 
         return ParsedQuestion(
@@ -491,9 +1196,124 @@ final class WrongQuestionOrganizer {
             correctAnswer: correctAnswer,
             userAnswer: userAnswer,
             explanation: explanation,
-            knowledgePoints: knowledgePoints,
             needsReview: needsReview
         )
+    }
+
+    func diagnosticParsedSnapshot(_ rawText: String) -> String {
+        let parsed = parse(rawText: rawText, recognitionMode: .fentiQuestionBank)
+        let object: [String: Any] = [
+            "question": parsed.question,
+            "options": parsed.options,
+            "correctAnswer": parsed.correctAnswer,
+            "explanation": parsed.explanation,
+            "needsReview": parsed.needsReview
+        ]
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: object,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        ) else { return "{}" }
+        return String(data: data, encoding: .utf8) ?? "{}"
+    }
+
+    func pageSnapshotIsUsable(_ rawText: String) -> Bool {
+        let parsed = parse(rawText: rawText, recognitionMode: .fentiQuestionBank)
+        return !parsed.needsReview &&
+            !parsed.question.hasPrefix("[OCR") &&
+            !parsed.explanation.hasPrefix("待人工补充")
+    }
+
+    /// 焚题库的“全选复制”顺序与视觉顺序不同：统计和解析在题型标记之前，
+    /// 当前题干和选项在题型标记之后。重排为旧解析器使用的标准顺序。
+    private func reorderedFentiPageSnapshotLines(_ lines: [String]) -> [String]? {
+        let markerPattern = #"^\s*[\[［【(（]\s*(单选题|多选题|判断题|论述题|问答题|简答题)\s*[\]］】)）]\s*$"#
+        guard let markerIndex = lines.lastIndex(where: {
+            $0.range(of: markerPattern, options: .regularExpression) != nil
+        }) else { return nil }
+
+        let stopPrefixes = [
+            "手动评判", "收藏本题", "纠错", "收起解析", "展开解析",
+            "试题答疑", "做题笔记", "答对", "答错", "返回", "计算器", "设置"
+        ]
+        var questionBlock: [String] = []
+        if markerIndex + 1 < lines.count {
+            for line in lines[(markerIndex + 1)...] {
+                if stopPrefixes.contains(where: line.hasPrefix) { break }
+                questionBlock.append(line)
+            }
+        }
+        guard !questionBlock.isEmpty else { return nil }
+
+        let resultIndex = lines[..<markerIndex].lastIndex {
+            $0 == "回答错误" || $0 == "回答正确"
+        }
+        var explanationStart: Int?
+        if let resultIndex {
+            explanationStart = lines[(resultIndex + 1)..<markerIndex].lastIndex {
+                $0.range(of: #"\d+(?:\.\d+)?%"#, options: .regularExpression) != nil
+            }.map { $0 + 1 }
+            if explanationStart == nil { explanationStart = resultIndex + 1 }
+        }
+        let explanationLines: [String]
+        if let start = explanationStart, start < markerIndex {
+            explanationLines = lines[start..<markerIndex].filter { line in
+                line != "共" && !line.contains("人答过") && !line.contains("平均正确率") &&
+                    line.range(of: #"^\d+(?:\.\d+)?%?$"#, options: .regularExpression) == nil
+            }
+        } else {
+            explanationLines = []
+        }
+
+        var rebuilt = [lines[markerIndex]] + questionBlock
+        if let answerLine = extractedCopiedReferenceAnswer(from: lines, before: markerIndex) {
+            rebuilt.append("参考答案：\(answerLine)")
+        } else {
+            rebuilt.append("参考答案：")
+        }
+        rebuilt.append("参考解析：")
+        rebuilt.append(contentsOf: explanationLines)
+        return rebuilt
+    }
+
+    private func extractedCopiedReferenceAnswer(from lines: [String], before end: Int) -> String? {
+        guard let label = lines[..<end].lastIndex(where: { $0.contains("参考答案") }) else { return nil }
+        let inline = lines[label].replacingOccurrences(
+            of: #"^.*?参考答案\s*[:：]?\s*"#,
+            with: "",
+            options: .regularExpression
+        ).trimmingCharacters(in: .whitespacesAndNewlines)
+        if inline.range(of: #"^[A-F]+$"#, options: .regularExpression) != nil { return inline }
+        let upperBound = min(end, label + 5)
+        guard label + 1 < upperBound else { return nil }
+        return lines[(label + 1)..<upperBound].first {
+            $0.range(of: #"^[A-F]+$"#, options: .regularExpression) != nil
+        }
+    }
+
+    private func extractEssayReferenceAnswer(
+        lines: [String],
+        answerIndex: Int,
+        explanationIndex: Int?
+    ) -> String {
+        guard answerIndex < lines.count else { return "" }
+        let end = explanationIndex ?? lines.count
+        guard answerIndex < end else { return "" }
+        var answerLines: [String] = []
+        let first = lines[answerIndex].replacingOccurrences(
+            of: #"^.*?参考答案\s*[:：]?\s*"#,
+            with: "",
+            options: .regularExpression
+        )
+        if !first.isEmpty { answerLines.append(first) }
+        if answerIndex + 1 < end {
+            for index in (answerIndex + 1)..<end {
+                let line = lines[index]
+                if isQuestionAreaStop(line) { break }
+                answerLines.append(line)
+            }
+        }
+        return answerLines.joined(separator: "\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private func cleanLine(_ value: String) -> String {
@@ -709,91 +1529,6 @@ final class WrongQuestionOrganizer {
             .replacingOccurrences(of: #"[^A-F]"#, with: "", options: .regularExpression)
     }
 
-    private func extractKnowledgePoints(from explanation: String, question: String) -> [String] {
-        let stopWords: Set<String> = [
-            "因为", "所以", "因此", "主要", "一般", "通常", "可以", "能够", "属于", "其中",
-            "这种", "这个", "这些", "以及", "对于", "进行", "形成", "存在", "出现", "发生",
-            "作用", "原因", "有关", "相关", "方面", "情况", "过程", "结果", "答案", "选项",
-            "正确", "错误", "本题", "考查", "大多数", "从而", "由于", "通过", "说明", "解析",
-            "患者", "病人", "可见", "可考虑", "表现", "症状", "体征", "部位", "时间", "其他",
-            "左侧", "右侧", "前者", "后者", "明显", "可能", "往往", "容易", "同时", "以上",
-            "以下", "每日", "每天", "小于", "大于", "增多", "减少", "增高", "降低", "异常",
-            "正常", "固定", "单个", "初期", "严重", "常见于", "未见", "符合", "不符", "排除",
-            "病史", "查体", "疾病", "考虑", "首先", "诊断", "发病", "进食", "此时", "之势"
-        ]
-        let tokens = chineseTokens(in: explanation)
-        let questionTokens = chineseTokens(in: question)
-
-        let medicalHints = [
-            "病", "炎", "症", "癌", "瘤", "中毒", "衰竭", "积液", "压塞", "气肿", "血压",
-            "血糖", "血脂", "电位", "步态", "导联", "心电图", "脉搏", "呼吸", "体温", "尿量",
-            "细胞", "组织", "器官", "神经", "肌肉", "血管", "激素", "抗体", "抗原", "细菌",
-            "病毒", "酶", "电解质", "酸碱", "收缩", "舒张", "心包", "胸膜", "甲状腺", "胰腺"
-        ]
-        let normalizedExplanation = explanation.replacingOccurrences(of: " ", with: "")
-        var scores: [String: Int] = [:]
-
-        // 首选题干与解析共同出现的概念，能显著减少泛化词和断裂词组。
-        for start in questionTokens.indices {
-            var candidate = ""
-            for length in 1...4 where start + length <= questionTokens.count {
-                let part = questionTokens[start + length - 1]
-                if stopWords.contains(part) { break }
-                candidate += part
-                guard candidate.count >= 2, candidate.count <= 14,
-                      normalizedExplanation.contains(candidate), !stopWords.contains(candidate) else { continue }
-                var score = 70 + min(candidate.count, 14)
-                if medicalHints.contains(where: candidate.contains) { score += 30 }
-                scores[candidate] = max(scores[candidate] ?? 0, score)
-            }
-        }
-
-        // 再补充解析中明确的医学实体或短词；不把任意三词拼成“知识点”。
-        for start in tokens.indices {
-            var candidate = ""
-            for length in 1...3 where start + length <= tokens.count {
-                let part = tokens[start + length - 1]
-                if stopWords.contains(part) { break }
-                candidate += part
-                let chineseCount = candidate.unicodeScalars.filter { (0x4E00...0x9FFF).contains(Int($0.value)) }.count
-                guard chineseCount >= 2, candidate.count <= 14, !stopWords.contains(candidate) else { continue }
-                let hasMedicalHint = medicalHints.contains(where: candidate.contains)
-                if length >= 2 && !hasMedicalHint { continue }
-                var score = min(candidate.count, 12)
-                if question.contains(candidate) { score += 45 }
-                if hasMedicalHint { score += 35 }
-                if length == 1 { score += 10 }
-                scores[candidate] = max(scores[candidate] ?? 0, score)
-            }
-        }
-
-        var selected: [String] = []
-        for candidate in scores.keys.sorted(by: {
-            if scores[$0] != scores[$1] { return (scores[$0] ?? 0) > (scores[$1] ?? 0) }
-            if $0.count != $1.count { return $0.count > $1.count }
-            return $0 < $1
-        }) {
-            if selected.contains(where: { $0.contains(candidate) || candidate.contains($0) }) { continue }
-            selected.append(candidate)
-            if selected.count == 4 { break }
-        }
-        return selected
-    }
-
-    private func chineseTokens(in text: String) -> [String] {
-        let tokenizer = NLTokenizer(unit: .word)
-        tokenizer.string = text
-        tokenizer.setLanguage(.simplifiedChinese)
-        var result: [String] = []
-        tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
-            let token = String(text[range]).trimmingCharacters(in: .whitespacesAndNewlines)
-            let chineseCount = token.unicodeScalars.filter { (0x4E00...0x9FFF).contains(Int($0.value)) }.count
-            if token.count <= 12, chineseCount >= 1 { result.append(token) }
-            return true
-        }
-        return result
-    }
-
     private func captureDate(for url: URL) -> Date {
         let pattern = #"(\d{8})_(\d{6})"#
         if let regex = try? NSRegularExpression(pattern: pattern),
@@ -810,14 +1545,6 @@ final class WrongQuestionOrganizer {
             }
         }
         return (try? url.resourceValues(forKeys: [.creationDateKey]).creationDate) ?? Date()
-    }
-
-    private func knowledgeOccurrenceCounts(in items: [WrongQuestionItem]) -> [String: Int] {
-        var counts: [String: Int] = [:]
-        for item in items {
-            for point in Set(item.knowledgePoints) { counts[point, default: 0] += 1 }
-        }
-        return counts
     }
 
     private func deduplicatedItems(_ items: [WrongQuestionItem]) -> DeduplicationResult {
@@ -859,21 +1586,32 @@ final class WrongQuestionOrganizer {
     private func duplicateKey(for item: WrongQuestionItem) -> String {
         // 误操作以题干为准：浅色选项标签或 OCR 文字差异不应导致同题漏判。
         // 题干无法识别时不合并，避免把多个不同的 OCR 失败截图误判成同一道题。
-        if item.question.hasPrefix("[OCR") { return "unreadable:\(item.sourceHash)" }
+        let subjectPrefix = (item.subject?.rawValue ?? "unclassified") + ":"
+        if item.question.hasPrefix("[OCR") { return subjectPrefix + "unreadable:\(item.sourceHash)" }
         let scalars = item.question.lowercased().unicodeScalars.filter { scalar in
             CharacterSet.alphanumerics.contains(scalar) ||
                 (0x4E00...0x9FFF).contains(Int(scalar.value))
         }
         let key = String(String.UnicodeScalarView(scalars))
-        return key.isEmpty ? "unreadable:\(item.sourceHash)" : key
+        return subjectPrefix + (key.isEmpty ? "unreadable:\(item.sourceHash)" : key)
+    }
+
+    private func studySubject(for imageURL: URL) -> StudySubject? {
+        let name = imageURL.lastPathComponent
+        return StudySubject.allCases.first { name.contains("_\($0.displayName)_") }
     }
 
     private func reviewIssueLabels(for item: WrongQuestionItem) -> [String] {
         var labels: [String] = []
+        let isEssay = isEssayItem(item)
+        if item.subject == nil { labels.append("科目待分类") }
+        if item.contentSubmission?.status == "failed", item.contentResult == nil {
+            labels.append("接口分类失败")
+        }
         if item.question.hasPrefix("[OCR") { labels.append("无题干") }
-        let minimumOptions = item.rawText.contains("判断题") ? 2 : 4
+        let minimumOptions = isEssay ? 0 : (item.rawText.contains("判断题") ? 2 : 4)
         if item.options.count < minimumOptions { labels.append("选项不全") }
-        if item.correctAnswer == "待校对" { labels.append("无答案") }
+        if !isEssay, item.correctAnswer == "待校对" { labels.append("无答案") }
         if item.explanation.hasPrefix("待人工补充") { labels.append("无解析") }
         if labels.isEmpty && item.needsReview { labels.append("OCR待校对") }
         return labels
@@ -910,6 +1648,8 @@ final class WrongQuestionOrganizer {
             desiredNames.insert(filename)
             let destination = folder.appendingPathComponent(filename)
             if fileManager.fileExists(atPath: destination.path) { continue }
+            // 已完成批次的原图可能已进入校验过的压缩包；不要因此阻断后续整理。
+            guard fileManager.fileExists(atPath: source.path) else { continue }
             try fileManager.copyItem(at: source, to: destination)
         }
 
@@ -929,121 +1669,128 @@ final class WrongQuestionOrganizer {
     }
 
     private func createQuestionBook(
-        items: [WrongQuestionItem],
-        occurrenceCountsByID: [String: Int],
+        rows: [QuestionWorkbookRow],
+        subject: StudySubject,
         at output: URL
     ) throws {
         var body = coverHTML(
-            title: "医学综合错题本",
-            subtitle: "纯题版 · 截图即收录",
-            itemCount: items.count,
-            note: "本册不含答案与解析，适合打印后独立练习。页面显示答对的截图也会收录，因为其中可能包含随机猜对或尚未掌握的内容。"
+            title: "\(subject.displayName)题本",
+            subtitle: "纯题版",
+            itemCount: rows.count,
+            note: "本册由题本工作簿生成，不含答案与解析，适合打印后独立练习。"
         )
-        for item in items {
+        for (index, item) in rows.enumerated() {
             body += "<section class='question'>"
-            body += "<h2>\(html(item.id)) <span class='date'>\(html(shortDate(item.capturedAt)))</span></h2>"
-            if let count = occurrenceCountsByID[item.id], count >= 2 {
-                body += "<p class='repeat-badge'>重复出现 \(count) 次 · 仍未掌握</p>"
+            body += "<h2>第 \(index + 1) 题 <span class='date'>\(html(item.curriculumChapter))</span></h2>"
+            if item.wrongAttempts >= 2 {
+                body += "<p class='repeat-badge'>累计答错 \(item.wrongAttempts) 次</p>"
             }
-            body += "<p class='stem'>\(html(item.question))</p>"
-            if item.options.isEmpty {
-                body += "<p class='review'>选项待人工校对，请对照原截图。</p>"
+            body += "<p class='stem'>\(html(item.stem))</p>"
+            if item.questionType == "论述题" {
+                body += "<p class='answer-space'>作答：</p>"
+                body += "<p class='answer-space'>____________________________________________________________</p>"
+                body += "<p class='answer-space'>____________________________________________________________</p>"
+                body += "<p class='answer-space'>____________________________________________________________</p>"
+            } else if item.options.isEmpty {
+                body += "<p class='review'>选项待补充。</p>"
             } else {
-                body += "<ol class='options'>" + item.options.map { "<li>\(html($0))</li>" }.joined() + "</ol>"
+                body += "<ol class='options'>" + item.options.enumerated().map {
+                    "<li>\(html(optionLabel($0.offset))). \(html($0.element))</li>"
+                }.joined() + "</ol>"
             }
-            body += "<p class='answer-space'>作答：________________________</p>"
+            if item.questionType != "论述题" {
+                body += "<p class='answer-space'>作答：________________________</p>"
+            }
             body += "</section>"
         }
-        try convertHTMLToDocx(documentHTML(title: "医学综合错题本_纯题", body: body), output: output)
+        try convertHTMLToDocx(
+            documentHTML(title: "\(subject.displayName)题本_纯题", body: body),
+            output: output
+        )
     }
 
     private func createAnswerBook(
-        items: [WrongQuestionItem],
-        occurrenceCountsByID: [String: Int],
+        rows: [QuestionWorkbookRow],
+        subject: StudySubject,
         at output: URL
     ) throws {
         var body = coverHTML(
-            title: "医学综合错题本",
+            title: "\(subject.displayName)题本",
             subtitle: "答案与解析",
-            itemCount: items.count,
-            note: "本册与纯题版题号一一对应，只保留参考答案、截图中的作答和原页面解析。薄弱知识点已另行整理成独立文档。"
+            itemCount: rows.count,
+            note: "本册由题本工作簿生成，与纯题版题号一一对应。"
         )
-        for item in items {
+        for (index, item) in rows.enumerated() {
             body += "<section class='question'>"
-            body += "<h2>\(html(item.id)) <span class='date'>\(html(shortDate(item.capturedAt)))</span></h2>"
-            if let count = occurrenceCountsByID[item.id], count >= 2 {
-                body += "<p class='repeat-badge'>重复出现 \(count) 次 · 仍未掌握</p>"
+            body += "<h2>第 \(index + 1) 题 <span class='date'>\(html(item.curriculumChapter))</span></h2>"
+            if item.wrongAttempts >= 2 {
+                body += "<p class='repeat-badge'>累计答错 \(item.wrongAttempts) 次</p>"
             }
-            body += "<p class='stem'>\(html(item.question))</p>"
-            body += "<div class='answer'><b>参考答案：</b>\(html(item.correctAnswer))"
-            body += "　<b>截图中的作答：</b>\(html(item.userAnswer))</div>"
-            body += "<h3>参考解析</h3><p>\(html(item.explanation))</p>"
-            if item.needsReview {
-                body += "<p class='review'>⚠ 本题存在 OCR 缺项，请对照原截图人工校对。</p>"
+            body += "<p class='stem'>\(html(item.stem))</p>"
+            if item.questionType == "论述题" {
+                body += "<div class='answer'><b>评分方式：</b>按原解析标注的考点和分值评分</div>"
+            } else {
+                body += "<div class='answer'><b>参考答案：</b>\(html(item.correctAnswer.isEmpty ? "待补充" : item.correctAnswer))</div>"
             }
-            body += "<p class='source'>截图：\(html(relativeSourcePath(item.sourcePath)))</p>"
+            body += "<h3>参考解析</h3><p>\(html(item.explanation.isEmpty ? "待补充" : item.explanation))</p>"
             body += "</section>"
         }
-        try convertHTMLToDocx(documentHTML(title: "医学综合错题本_答案与解析", body: body), output: output)
+        try convertHTMLToDocx(
+            documentHTML(title: "\(subject.displayName)题本_答案与解析", body: body),
+            output: output
+        )
     }
 
-    private func createKnowledgeBook(
-        items: [WrongQuestionItem],
-        knowledgeCounts: [String: Int],
-        at output: URL
-    ) throws {
-        let repeated = knowledgeCounts.filter { $0.value >= 2 }
-            .sorted { $0.value == $1.value ? $0.key < $1.key : $0.value > $1.value }
-        let single = knowledgeCounts.filter { $0.value == 1 }.map(\.key).sorted()
-        var itemIDsByPoint: [String: [String]] = [:]
+    private func createStudyKnowledgeBook(items: [WrongQuestionItem], at output: URL) throws {
+        struct Card {
+            let section: String
+            let chapter: String
+            let value: StudyKnowledgeCard
+        }
+        var seen: Set<String> = []
+        var cards: [Card] = []
         for item in items {
-            for point in Set(item.knowledgePoints) {
-                itemIDsByPoint[point, default: []].append(item.id)
+            guard let result = item.contentResult else { continue }
+            for card in result.knowledgeCards {
+                let key = normalizedKnowledgeKey(card.title + "|" + card.memoryText)
+                guard seen.insert(key).inserted else { continue }
+                cards.append(Card(section: result.medicalCategory.section, chapter: result.medicalCategory.chapter, value: card))
             }
         }
 
-        var body = coverHTML(
-            title: "医学综合错题本",
-            subtitle: "薄弱知识点",
-            itemCount: knowledgeCounts.count,
-            itemUnit: "条",
-            note: "知识点仅从截图中已经识别到的文字自动归纳，不补写外部内容。出现两次或以上的知识点用红色标出，表示经两次记录仍需重点巩固。当前重点：\(repeated.count) 个。"
-        )
-
-        body += "<section class='knowledge-section'><h2>重点巩固：两次或以上</h2>"
-        if repeated.isEmpty {
-            body += "<p>当前没有重复出现的知识点。</p>"
-        } else {
-            body += "<ol class='knowledge-index'>"
-            for (point, count) in repeated {
-                let ids = (itemIDsByPoint[point] ?? []).sorted().joined(separator: "、")
-                body += "<li class='repeat'><b>\(html(point))</b>"
-                body += "<div>累计 \(count) 次 · 重复出现，仍未掌握</div>"
-                body += "<div class='related'>关联题目：\(html(ids))</div></li>"
+        var body = "<section class='study-opening'><div class='kicker'>成人高考专升本 · 医学综合</div><h1>医学综合知识点背诵汇总</h1></section>"
+        for section in MedicalCurriculumTaxonomy.sections {
+            let sectionCards = cards.filter { $0.section == section.name }
+            guard !sectionCards.isEmpty else { continue }
+            body += "<section class='study-section'><h2>\(html(section.name))</h2>"
+            for chapter in section.chapters {
+                let chapterCards = sectionCards.filter { $0.chapter == chapter }
+                guard !chapterCards.isEmpty else { continue }
+                body += "<h3 class='study-chapter'>\(html(chapter))</h3>"
+                for card in chapterCards {
+                    body += "<article class='memory-card'><h4>\(html(card.value.title))</h4>"
+                    body += "<p class='memory-text'>\(html(card.value.memoryText))</p>"
+                    if !card.value.pitfalls.isEmpty {
+                        body += "<div class='pitfalls'><b>易错辨析</b><ul>" + card.value.pitfalls.map { "<li>\(html($0))</li>" }.joined() + "</ul></div>"
+                    }
+                    body += "</article>"
+                }
             }
-            body += "</ol>"
+            body += "</section>"
         }
-        body += "</section>"
+        try convertHTMLToDocx(documentHTML(title: "医学综合知识点背诵汇总", body: body), output: output)
+    }
 
-        body += "<section class='knowledge-section'><h2>待巩固：出现一次</h2>"
-        if single.isEmpty {
-            body += "<p>当前没有仅出现一次的知识点。</p>"
-        } else {
-            body += "<ol class='knowledge-index'>"
-            for point in single {
-                let ids = (itemIDsByPoint[point] ?? []).sorted().joined(separator: "、")
-                body += "<li><b>\(html(point))</b><div class='related'>关联题目：\(html(ids))</div></li>"
-            }
-            body += "</ol>"
-        }
-        body += "</section>"
+    private func optionLabel(_ index: Int) -> String {
+        guard (0..<26).contains(index), let scalar = UnicodeScalar(65 + index) else { return "?" }
+        return String(Character(scalar))
+    }
 
-        let missing = items.filter { $0.knowledgePoints.isEmpty }.map(\.id)
-        if !missing.isEmpty {
-            body += "<section class='knowledge-section'><h2>待人工补充</h2>"
-            body += "<p class='review'>以下题目未能从现有解析中可靠抽取知识点：\(html(missing.joined(separator: "、")))。</p></section>"
+    private func normalizedKnowledgeKey(_ value: String) -> String {
+        let scalars = value.lowercased().unicodeScalars.filter { scalar in
+            CharacterSet.alphanumerics.contains(scalar) || (0x4E00...0x9FFF).contains(Int(scalar.value))
         }
-        try convertHTMLToDocx(documentHTML(title: "医学综合错题本_薄弱知识点", body: body), output: output)
+        return String(String.UnicodeScalarView(scalars))
     }
 
     private func coverHTML(title: String, subtitle: String, itemCount: Int, itemUnit: String = "题", note: String) -> String {
@@ -1084,16 +1831,20 @@ final class WrongQuestionOrganizer {
           .options li { margin: 2pt 0; }
           .answer-space { color: #666; margin-top: 8pt; }
           .answer { background: #E8EEF5; padding: 7pt 9pt; margin: 6pt 0; }
-          .knowledge { margin: 3pt 0 7pt 18pt; padding: 0; }
-          .knowledge li { margin: 2pt 0; }
-          .knowledge-section { margin-bottom: 18pt; }
-          .knowledge-index { margin: 5pt 0 10pt 20pt; padding: 0; }
-          .knowledge-index li { margin: 0 0 9pt; page-break-inside: avoid; }
-          .related { color: #666; font-size: 9pt; margin-top: 2pt; }
           .repeat { color: #C00000; }
           .repeat-badge { color: #C00000; font-weight: 700; margin: -4pt 0 7pt; }
           .review { color: #C00000; font-weight: 600; }
           .source { color: #777; font-size: 8pt; margin-top: 7pt; }
+          .study-opening { padding: 8pt 0 18pt; border-bottom: 3px solid #2E74B5; margin-bottom: 18pt; }
+          .study-opening h1 { font-size: 22pt; }
+          .study-section { margin-bottom: 20pt; }
+          .study-chapter { margin: 14pt 0 7pt; padding-bottom: 3pt; border-bottom: 1px solid #B4C7DC; }
+          .memory-card { page-break-inside: avoid; margin: 0 0 10pt; padding: 8pt 10pt; background: #F5F8FB; border-left: 3px solid #2E74B5; }
+          .memory-card h4 { color: #1F4D78; font-size: 11.5pt; margin: 0 0 4pt; }
+          .memory-text { margin: 0; }
+          .pitfalls { color: #8B1A1A; margin-top: 5pt; }
+          .pitfalls ul { margin: 3pt 0 0 18pt; padding: 0; }
+          .pitfalls li { margin: 2pt 0; }
         </style></head><body>\(body)</body></html>
         """
     }

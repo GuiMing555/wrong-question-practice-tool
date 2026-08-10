@@ -1,7 +1,7 @@
 import Foundation
 
 enum QuestionBankSchema {
-    static let currentVersion = 3
+    static let currentVersion = 8
 
     static func migrate(_ db: SQLiteDatabase) throws {
         try db.execute("""
@@ -22,6 +22,11 @@ enum QuestionBankSchema {
                 case 1: try migration1(db)
                 case 2: try migration2(db)
                 case 3: try migration3(db)
+                case 4: try migration4(db)
+                case 5: try migration5(db)
+                case 6: try migration6(db)
+                case 7: try migration7(db)
+                case 8: try migration8(db)
                 default: break
                 }
                 try db.execute(
@@ -251,5 +256,149 @@ enum QuestionBankSchema {
             """,
             [.text("{\"cleared\":\(affected)}"), .real(timestamp)]
         )
+    }
+
+    private static func migration4(_ db: SQLiteDatabase) throws {
+        let statements = [
+            "ALTER TABLE questions ADD COLUMN curriculum_section TEXT",
+            "ALTER TABLE questions ADD COLUMN curriculum_chapter TEXT",
+            "ALTER TABLE questions ADD COLUMN content_analysis_json TEXT",
+            "ALTER TABLE settings ADD COLUMN workbook_output_path TEXT"
+        ]
+        for statement in statements { try db.execute(statement) }
+    }
+
+    private static func migration5(_ db: SQLiteDatabase) throws {
+        let statements = [
+            "ALTER TABLE session_items RENAME TO session_items_legacy",
+            """
+            CREATE TABLE session_items (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES practice_sessions(id) ON DELETE CASCADE,
+                question_id TEXT NOT NULL REFERENCES questions(id),
+                position INTEGER NOT NULL,
+                question_snapshot_json TEXT NOT NULL,
+                option_order_json TEXT NOT NULL,
+                correct_option_ids_json TEXT NOT NULL,
+                answered_at REAL,
+                attempt_id TEXT UNIQUE,
+                UNIQUE(session_id, position)
+            )
+            """,
+            """
+            INSERT INTO session_items(
+                id, session_id, question_id, position, question_snapshot_json,
+                option_order_json, correct_option_ids_json, answered_at, attempt_id
+            )
+            SELECT id, session_id, question_id, position, question_snapshot_json,
+                   option_order_json, correct_option_ids_json, answered_at, attempt_id
+            FROM session_items_legacy
+            """,
+            """
+            CREATE TABLE attempts_v5 (
+                id TEXT PRIMARY KEY,
+                submission_token TEXT NOT NULL UNIQUE,
+                session_id TEXT NOT NULL REFERENCES practice_sessions(id),
+                session_item_id TEXT NOT NULL REFERENCES session_items(id),
+                question_id TEXT NOT NULL REFERENCES questions(id),
+                mode TEXT NOT NULL,
+                submitted_at REAL NOT NULL,
+                selected_option_ids_json TEXT NOT NULL,
+                displayed_option_order_json TEXT NOT NULL,
+                correct_option_ids_json TEXT NOT NULL,
+                is_correct INTEGER NOT NULL,
+                marked_unsure INTEGER NOT NULL,
+                was_in_wrong_book INTEGER NOT NULL,
+                is_in_wrong_book INTEGER NOT NULL,
+                wrong_progress_before INTEGER NOT NULL,
+                wrong_progress_after INTEGER NOT NULL,
+                removed_from_wrong_book INTEGER NOT NULL,
+                explanation_snapshot TEXT NOT NULL,
+                result_json TEXT
+            )
+            """,
+            """
+            INSERT INTO attempts_v5(
+                id, submission_token, session_id, session_item_id, question_id, mode,
+                submitted_at, selected_option_ids_json, displayed_option_order_json,
+                correct_option_ids_json, is_correct, marked_unsure, was_in_wrong_book,
+                is_in_wrong_book, wrong_progress_before, wrong_progress_after,
+                removed_from_wrong_book, explanation_snapshot, result_json
+            )
+            SELECT id, submission_token, session_id, session_item_id, question_id, mode,
+                   submitted_at, selected_option_ids_json, displayed_option_order_json,
+                   correct_option_ids_json, is_correct, marked_unsure, was_in_wrong_book,
+                   is_in_wrong_book, wrong_progress_before, wrong_progress_after,
+                   removed_from_wrong_book, explanation_snapshot, result_json
+            FROM attempts
+            """,
+            "DROP TABLE attempts",
+            "ALTER TABLE attempts_v5 RENAME TO attempts",
+            "DROP TABLE session_items_legacy",
+            "CREATE INDEX session_items_session_position ON session_items(session_id, position)",
+            "CREATE INDEX attempts_question_time ON attempts(question_id, submitted_at DESC)",
+            "CREATE INDEX attempts_session ON attempts(session_id, submitted_at)",
+            """
+            CREATE TRIGGER attempts_are_append_only_update
+            BEFORE UPDATE ON attempts BEGIN
+                SELECT RAISE(ABORT, 'attempts are append-only');
+            END
+            """,
+            """
+            CREATE TRIGGER attempts_are_append_only_delete
+            BEFORE DELETE ON attempts BEGIN
+                SELECT RAISE(ABORT, 'attempts are append-only');
+            END
+            """
+        ]
+        for statement in statements { try db.execute(statement) }
+    }
+
+    private static func migration6(_ db: SQLiteDatabase) throws {
+        let statements = [
+            "ALTER TABLE settings ADD COLUMN dynamic_plan_enabled INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE settings ADD COLUMN dynamic_plan_target_date REAL",
+            "ALTER TABLE practice_sessions ADD COLUMN plan_date_key TEXT"
+        ]
+        for statement in statements { try db.execute(statement) }
+    }
+
+    private static func migration7(_ db: SQLiteDatabase) throws {
+        let statements = [
+            """
+            CREATE TABLE question_api_responses (
+                id TEXT PRIMARY KEY,
+                question_id TEXT NOT NULL REFERENCES questions(id) ON DELETE CASCADE,
+                input_hash TEXT NOT NULL,
+                endpoint TEXT NOT NULL DEFAULT '',
+                model TEXT NOT NULL DEFAULT '',
+                response_json TEXT NOT NULL,
+                received_at REAL NOT NULL,
+                created_at REAL NOT NULL,
+                UNIQUE(question_id, input_hash)
+            )
+            """,
+            "CREATE INDEX question_api_responses_question_time ON question_api_responses(question_id, received_at DESC)",
+            "CREATE INDEX question_api_responses_received ON question_api_responses(received_at)",
+            """
+            INSERT OR IGNORE INTO question_api_responses(
+                id, question_id, input_hash, endpoint, model, response_json, received_at, created_at
+            )
+            SELECT 'legacy-' || q.id, q.id, 'legacy:' || q.id, 'legacy-import', '',
+                   q.content_analysis_json, COALESCE(q.captured_at, q.updated_at), q.updated_at
+            FROM questions q
+            WHERE q.content_analysis_json IS NOT NULL AND TRIM(q.content_analysis_json) != ''
+            """
+        ]
+        for statement in statements { try db.execute(statement) }
+    }
+
+    private static func migration8(_ db: SQLiteDatabase) throws {
+        let statements = [
+            "ALTER TABLE questions ADD COLUMN response_type TEXT NOT NULL DEFAULT 'choice' CHECK (response_type IN ('choice', 'essay'))",
+            "ALTER TABLE attempts ADD COLUMN typed_answer TEXT",
+            "ALTER TABLE attempts ADD COLUMN essay_evaluation_json TEXT"
+        ]
+        for statement in statements { try db.execute(statement) }
     }
 }

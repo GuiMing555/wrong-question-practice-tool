@@ -3,15 +3,15 @@ set -euo pipefail
 
 MODE="${1:-run}"
 MIN_SYSTEM_VERSION="13.0"
-APP_VERSION="${APP_VERSION:-1.2.0}"
-APP_BUILD_NUMBER="${APP_BUILD_NUMBER:-3}"
+APP_VERSION="${APP_VERSION:-1.3.0}"
+APP_BUILD_NUMBER="${APP_BUILD_NUMBER:-38}"
 
 CAPTURE_PRODUCT="WrongQuestionDailyOrganizer"
 CAPTURE_DISPLAY_NAME="错题每日自动化整理"
 CAPTURE_BUNDLE_ID="com.guiming.wrong-question-daily-organizer"
 
 PRACTICE_PRODUCT="MedicalQuestionPractice"
-PRACTICE_DISPLAY_NAME="医学综合练习"
+PRACTICE_DISPLAY_NAME="考试题本练习"
 PRACTICE_BUNDLE_ID="com.guiming.medical-question-practice"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,11 +19,20 @@ DIST_DIR="$ROOT_DIR/dist"
 CAPTURE_BUNDLE="$DIST_DIR/$CAPTURE_DISPLAY_NAME.app"
 PRACTICE_BUNDLE="$DIST_DIR/$PRACTICE_DISPLAY_NAME.app"
 
-pkill -x "$CAPTURE_PRODUCT" >/dev/null 2>&1 || true
-pkill -x "WrongQuestionCapture" >/dev/null 2>&1 || true
-pkill -x "$PRACTICE_PRODUCT" >/dev/null 2>&1 || true
-
 cd "$ROOT_DIR"
+CIVIL_SERVICE_BUNDLE_READY=false
+if [[ -n "${CIVIL_SERVICE_BANK_SOURCE:-}" ]]; then
+  if [[ ! -f "$CIVIL_SERVICE_BANK_SOURCE" ]]; then
+    echo "CIVIL_SERVICE_BANK_SOURCE 指向的文件不存在。" >&2
+    exit 1
+  fi
+  python3 "$ROOT_DIR/script/build_civil_service_bank.py" \
+    "$CIVIL_SERVICE_BANK_SOURCE" \
+    "$ROOT_DIR/.build/civil-service-bank/questions.jsonl"
+  CIVIL_SERVICE_BUNDLE_READY=true
+else
+  echo "未提供 CIVIL_SERVICE_BANK_SOURCE：开源构建不内置公务员题库数据。"
+fi
 swift build --configuration release
 BUILD_DIR="$(swift build --configuration release --show-bin-path)"
 
@@ -46,6 +55,12 @@ stage_bundle() {
 
   if [[ "$copy_resources" == "true" ]]; then
     cp -R "$ROOT_DIR/Resources/DocxFonts" "$resources_dir/DocxFonts"
+  fi
+
+  if [[ "$product" == "$PRACTICE_PRODUCT" && "$CIVIL_SERVICE_BUNDLE_READY" == "true" ]]; then
+    mkdir -p "$resources_dir/CivilServiceQuestionBank"
+    cp "$ROOT_DIR/.build/civil-service-bank/questions.jsonl" \
+      "$resources_dir/CivilServiceQuestionBank/questions.jsonl"
   fi
 
   cat >"$contents/Info.plist" <<PLIST
@@ -79,12 +94,21 @@ stage_bundle() {
 </plist>
 PLIST
 
+  # Public builds use an ad-hoc signature. No certificate, team identity,
+  # provisioning profile, or Keychain signing material enters the bundle.
   /usr/bin/codesign --force --deep --sign - "$bundle_path" >/dev/null
+  /usr/bin/codesign --verify --deep --strict --verbose=2 "$bundle_path"
   /usr/bin/plutil -lint "$contents/Info.plist" >/dev/null
 }
 
 stage_bundle "$CAPTURE_PRODUCT" "$CAPTURE_DISPLAY_NAME" "$CAPTURE_BUNDLE_ID" "$CAPTURE_BUNDLE" true true
-stage_bundle "$PRACTICE_PRODUCT" "$PRACTICE_DISPLAY_NAME" "$PRACTICE_BUNDLE_ID" "$PRACTICE_BUNDLE" false false
+stage_bundle "$PRACTICE_PRODUCT" "$PRACTICE_DISPLAY_NAME" "$PRACTICE_BUNDLE_ID" "$PRACTICE_BUNDLE" false true
+
+if [[ "$MODE" != "--build-only" && "$MODE" != "build-only" ]]; then
+  pkill -x "$CAPTURE_PRODUCT" >/dev/null 2>&1 || true
+  pkill -x "WrongQuestionCapture" >/dev/null 2>&1 || true
+  pkill -x "$PRACTICE_PRODUCT" >/dev/null 2>&1 || true
+fi
 
 open_capture() {
   /usr/bin/open -n "$CAPTURE_BUNDLE"
